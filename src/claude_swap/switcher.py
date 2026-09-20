@@ -2865,6 +2865,94 @@ class ClaudeAccountSwitcher:
         )
         return True
 
+    def _foreign_generation_ahead(
+        self, account_num: str, email: str, credentials: str
+    ) -> bool:
+        """Whether ``credentials`` is a NEWER generation of this slot's family
+        than the backup the slot currently holds.
+
+        The live store can end up holding another managed slot's bytes: a
+        Claude Code session that outlived a switch refreshes the token it
+        still carries in memory and writes the successor to the live store,
+        under a config that now names a different slot. Those bytes are the
+        sole copy of that generation -- the owning slot's backup holds the
+        predecessor the rotation just consumed -- so leaving them unclaimed is
+        what kills the account.
+
+        Ownership alone does not license the write: identity proves whose
+        family the bytes belong to, not which generation is later, and a blind
+        write replaces a live backup with a spent one. The generation question
+        is answered exactly as :meth:`_session_profile_ahead` answers it --
+        fingerprint tells generations apart, access-token issue time
+        (``expiresAt``) orders them -- and every missing piece of evidence
+        answers False rather than guessing, because a wrong True destroys the
+        slot this is meant to save.
+
+        A refresh token already past its own ``refreshTokenExpiresAt`` answers
+        False too: that grant is dead by the clock whatever its generation, so
+        adopting it would displace a backup for nothing.
+        """
+        incoming = oauth.extract_oauth_data(credentials) or {}
+        if not (incoming.get("accessToken") and incoming.get("refreshToken")):
+            return False  # never seed a backup with a partial token pair
+        rt_expires = incoming.get("refreshTokenExpiresAt")
+        if rt_expires is not None:
+            try:
+                if float(rt_expires) <= time.time() * 1000:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        backup, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            return False  # a read error is not evidence that the slot is behind
+        if not backup:
+            return True  # nothing stored to displace
+        if oauth.credential_fingerprint(
+            credentials
+        ) == oauth.credential_fingerprint(backup):
+            return False  # same generation -- nothing drifted
+        stored = oauth.extract_oauth_data(backup) or {}
+        try:
+            return float(incoming.get("expiresAt") or 0) > float(
+                stored.get("expiresAt") or 0
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _adopt_foreign_credential(
+        self, account_num: str, email: str, credentials: str
+    ) -> bool:
+        """Route another slot's displaced successor into that slot's backup.
+
+        Returns True only when the bytes reached the backup. A successful
+        adoption is as good a license to overwrite the live store as the
+        unclaimed stash is -- better, since the bytes land where the account
+        will actually look for them -- so the caller may skip the stash. Any
+        failure returns False and the caller must fall back to stashing: the
+        one outcome that must never happen is bytes neither adopted nor
+        preserved.
+        """
+        if not email or not self._foreign_generation_ahead(
+            account_num, email, credentials
+        ):
+            return False
+        try:
+            self._write_account_credentials(account_num, email, credentials)
+        except Exception as e:
+            self._logger.warning(
+                "Could not adopt the live credential into Account-%s "
+                "(%s); falling back to a safety copy.",
+                account_num,
+                e,
+            )
+            return False
+        self._logger.info(
+            "Adopted the live credential into Account-%s's backup: a newer "
+            "generation of that account's family, displaced by a switch.",
+            account_num,
+        )
+        return True
+
     def _delete_session_profile(self, account_num: str, email: str) -> None:
         """Remove an account's session profile dir and its keychain entry.
 
@@ -7034,15 +7122,36 @@ class ClaudeAccountSwitcher:
                     provenance, data,
                 )
                 if kind in ("foreign", "alien", "known-foreign"):
-                    # Positively not this slot's bytes: never into a slot;
-                    # never silently destroyed. The safety copy (which raises
-                    # on failure, aborting before the live store is
-                    # overwritten) is the license to proceed.
-                    self._stash_live_credential(
-                        original_creds, kind, current_account,
-                        provenance.get("resolved"),
-                    )
-                    if kind == "foreign":
+                    # Positively not this slot's bytes: never into THIS slot;
+                    # never silently destroyed. Two licenses to proceed, tried
+                    # in that order -- adoption into the owning slot (only
+                    # when the generation evidence says these bytes are ahead
+                    # of what that slot holds), else the safety copy, which
+                    # raises on failure and so aborts before the live store is
+                    # overwritten.
+                    adopted = False
+                    if kind == "foreign" and foreign_slot:
+                        adopted = self._adopt_foreign_credential(
+                            foreign_slot,
+                            (data.get("accounts", {})
+                                 .get(foreign_slot, {})
+                                 .get("email", "")),
+                            original_creds,
+                        )
+                    if not adopted:
+                        self._stash_live_credential(
+                            original_creds, kind, current_account,
+                            provenance.get("resolved"),
+                        )
+                    if kind == "foreign" and adopted:
+                        msg = (
+                            "Credential ownership mismatch detected. The live "
+                            "credential was a newer generation of Account-"
+                            f"{foreign_slot}'s login, so it was written into "
+                            f"that account's backup rather than into Account-"
+                            f"{current_account}. No action needed."
+                        )
+                    elif kind == "foreign":
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             "credential was preserved and was not written "

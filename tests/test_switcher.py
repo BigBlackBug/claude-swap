@@ -6917,10 +6917,13 @@ class TestProvenanceGuard:
     ):
         """The poisoning precondition: live bytes belong to another managed
         slot (uuid-positive). They must be preserved as a safety copy — not
-        written into the outgoing slot, and not routed into the resolved slot
-        either (identity proves ownership, not generation freshness). Here the
-        foreign slot is also the switch target: the switch still activates the
-        target's *stored* backup, never the displaced live bytes."""
+        written into the outgoing slot, and, ABSENT GENERATION EVIDENCE, not
+        routed into the resolved slot either (identity proves ownership, not
+        generation freshness). These blobs carry no ``expiresAt``, so the
+        generation question has no answer and preservation is the only outcome;
+        the adoption path is exercised separately below. Here the foreign slot
+        is also the switch target: the switch still activates the target's
+        *stored* backup, never the displaced live bytes."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -6956,6 +6959,103 @@ class TestProvenanceGuard:
         )
         # The switch itself proceeded, onto the stored backup.
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
+
+    # -- adoption: foreign bytes that are a NEWER generation ---------------
+    #
+    # The loss this closes: a Claude Code session that outlived a switch
+    # refreshes the token it still holds in memory and writes the successor
+    # to the live store. Those bytes are the sole copy of that generation —
+    # the owning slot's backup holds the predecessor the rotation consumed —
+    # so preserving them in the stash and never returning them is what kills
+    # the account. Ownership alone still may not license the write; the
+    # generation evidence must say these bytes are AHEAD.
+
+    _FUTURE_MS = 4_102_444_800_000  # 2100-01-01, comfortably unexpired
+
+    def _owner_pair(self, *, stored_exp: int, live_exp: int, rt_exp=None):
+        """A slot-2 backup and a live blob of the same family, ordered by
+        access-token issue time. ``rt_exp`` defaults to unexpired."""
+        stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-stored", "refreshToken": "rt-2-stored",
+            "expiresAt": stored_exp,
+        }})
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-rotated", "refreshToken": "rt-2-rotated",
+            "expiresAt": live_exp,
+            "refreshTokenExpiresAt": self._FUTURE_MS if rt_exp is None else rt_exp,
+        }})
+        return stored, live
+
+    def _run_foreign(self, temp_home, sample_sequence_data, stored, live):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        creds_store[("2", "account2@example.com")] = stored
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        return switcher, creds_store, op
+
+    def test_foreign_newer_generation_is_adopted_into_its_owner(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Displaced successor, positively newer than what its owner holds:
+        it goes into that owner's backup instead of the stash. The outgoing
+        slot is still never written, and no safety copy is needed — the bytes
+        landed where the account will look for them, which is a stronger
+        license to overwrite the live store than the stash is."""
+        stored, live = self._owner_pair(stored_exp=1_000, live_exp=2_000)
+        switcher, creds_store, op = self._run_foreign(
+            temp_home, sample_sequence_data, stored, live,
+        )
+        assert creds_store[("2", "account2@example.com")] == live
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert switcher.list_unclaimed_credentials() == {}
+        assert any(
+            "newer generation" in w and "No action needed" in w
+            for w in op["warnings"]
+        )
+
+    def test_foreign_older_generation_is_preserved_not_adopted(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The failure adoption must never cause: bytes of the right family
+        but an EARLIER generation would replace a live backup with a spent
+        one. Ownership matches, ordering says no — preserve, do not adopt."""
+        stored, live = self._owner_pair(stored_exp=2_000, live_exp=1_000)
+        switcher, creds_store, op = self._run_foreign(
+            temp_home, sample_sequence_data, stored, live,
+        )
+        assert creds_store[("2", "account2@example.com")] == stored
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        assert _read_safety_copy(switcher, next(iter(entries))) == live
+
+    def test_foreign_with_dead_refresh_token_is_preserved_not_adopted(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A grant past its own ``refreshTokenExpiresAt`` is dead by the clock
+        whatever its generation. Adopting it would displace a backup that may
+        still be usable, so the answer is preservation even though the bytes
+        are the later generation."""
+        stored, live = self._owner_pair(
+            stored_exp=1_000, live_exp=2_000, rt_exp=1_000,
+        )
+        switcher, creds_store, op = self._run_foreign(
+            temp_home, sample_sequence_data, stored, live,
+        )
+        assert creds_store[("2", "account2@example.com")] == stored
+        assert len(switcher.list_unclaimed_credentials()) == 1
 
     def test_foreign_synced_lineage_warns_without_any_write(
         self, temp_home, mock_claude_config, sample_sequence_data,

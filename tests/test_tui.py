@@ -1288,7 +1288,13 @@ class _FakeEngine:
 
     instances: list["_FakeEngine"] = []
 
+    # Mirrors the real engine's read-only view of a scripted wave.
+    sequence = None
+    sequence_position = -1
+
     def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
+        if kwargs.get("sequence"):
+            self.sequence = tuple(kwargs["sequence"])
         self.settings = settings
         self.on_event = on_event
         self.dry_run = dry_run
@@ -1474,6 +1480,118 @@ class TestAutoScreen:
             screen.action_threshold_step(-60.0)
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
+
+    async def test_the_chain_is_shown_in_its_own_order(
+        self, tmp_path, fake_engine
+    ):
+        """A ranking would be a lie during a wave: the user wrote the order,
+        and the only question the panel can answer is how far along it is."""
+        fake_engine.sequence = ("3", "1", "2")
+        fake_engine.sequence_position = 0
+        try:
+            fake = FakeSwitcher(
+                [
+                    make_account(1, active=True, entry=make_entry(5.0, 5.0)),
+                    make_account(2, entry=make_entry(10.0, 10.0)),
+                    make_account(3, entry=make_entry(90.0, 20.0)),
+                ],
+                tmp_path,
+            )
+            app = make_app(fake)
+            async with app.run_test(size=(100, 40)) as pilot:
+                await self._open(pilot)
+                await settle(pilot)
+                from textual.widgets import Static
+
+                plain = app.screen.query_one("#candidates", Static).render().plain
+                assert plain.startswith("Chain")
+                # Declared order, not headroom order: 3 is the most spent and
+                # still leads, because that is where the chain starts.
+                assert (
+                    plain.index("user3@example.com")
+                    < plain.index("user1@example.com")
+                    < plain.index("user2@example.com")
+                )
+        finally:
+            fake_engine.sequence = None
+            fake_engine.sequence_position = -1
+
+    async def test_the_summary_names_the_chain_not_a_threshold(
+        self, tmp_path, fake_engine
+    ):
+        fake_engine.sequence = ("2", "1")
+        fake_engine.sequence_position = 1
+        try:
+            fake = FakeSwitcher(
+                [make_account(1, active=True), make_account(2)], tmp_path
+            )
+            app = make_app(fake)
+            async with app.run_test(size=(100, 40)) as pilot:
+                await self._open(pilot)
+                await settle(pilot)
+                from textual.widgets import Static
+
+                plain = app.screen.query_one("#auto-summary", Static).render().plain
+                assert "chain 2 → 1" in plain
+                assert "step 2/2" in plain
+                assert "threshold" not in plain
+        finally:
+            fake_engine.sequence = None
+            fake_engine.sequence_position = -1
+
+    async def test_the_threshold_knob_is_inert_during_a_wave(
+        self, tmp_path, fake_engine
+    ):
+        """The knob offers one number while the decision reads one bar per
+        window, and a wave is steered by its chain either way."""
+        fake_engine.sequence = ("2", "1")
+        try:
+            fake = FakeSwitcher(
+                [make_account(1, active=True), make_account(2)], tmp_path
+            )
+            app = make_app(fake)
+            async with app.run_test(size=(100, 40)) as pilot:
+                await self._open(pilot)
+                await settle(pilot)
+                await pilot.press("t")
+                await settle(pilot)
+                assert app.screen._adjusting is False
+        finally:
+            fake_engine.sequence = None
+
+    async def test_consume_first_orders_by_weekly_reset(
+        self, tmp_path, fake_engine
+    ):
+        """The panel must not offer a second opinion: consume-first spends
+        the most perishable quota first, so the soonest weekly reset leads."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "consume-first"},
+        }))
+        roomy_but_later = make_entry(10.0, 10.0)
+        roomy_but_later.last_good["seven_day"]["resets_at"] = _iso_in(86400 * 5)
+        spent_but_sooner = make_entry(70.0, 70.0)
+        spent_but_sooner.last_good["seven_day"]["resets_at"] = _iso_in(3600)
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=roomy_but_later),
+                make_account(3, entry=spent_but_sooner),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.startswith("Next by weekly reset")
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

@@ -367,7 +367,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "sequence"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -736,9 +736,25 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        sequence: tuple[str, ...] | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # Scripted wave (`cswap auto --seq 2 3 1`): the caller declares the
+        # order, thresholds still decide when to leave. Position lives HERE
+        # and nowhere else -- not in settings.json, not in the state file --
+        # because the wave belongs to this process: kill it and the wave is
+        # over, which is the whole point of a one-shot run.
+        self._sequence = sequence
+        # Index of the element we are sitting on; -1 = not anchored yet, so
+        # the first tick's job is to jump to the head of the chain.
+        self._seq_pos = -1
+        # Set once the wave has nothing left to do; `run_loop` reads it and
+        # returns instead of sleeping until the next interval.
+        self._seq_done = False
+        # True while the final hop back to the head is in flight, so the
+        # landing can be recognised as the end rather than as a step.
+        self._seq_finishing = False
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -1067,7 +1083,34 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
-        if active_headroom is not None:
+        seq_ordered: list[str] = []
+        if self._sequence is not None:
+            # A scripted wave answers "should we move?" the same way (the
+            # per-window bars) but "where to?" from the chain, so it takes
+            # neither the strategy branches below nor the candidate census.
+            # Unreadable active usage reads as "not over the bar" and simply
+            # holds: a wave has somewhere specific to be, and guessing is
+            # worse than waiting a tick.
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            seq_ordered, verdict = self._sequence_step(
+                current, usage, self._over_bar(current, usage.get(current))
+            )
+            if verdict:
+                if verdict == "finished":
+                    self._seq_done = True
+                self._emit(
+                    NoSwitchEvent(
+                        reason=(
+                            "sequence-finished" if verdict == "finished"
+                            else "below-threshold"
+                        ),
+                        detail=self._sequence_detail(verdict, current, settings),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            trigger = "sequence"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
@@ -1186,7 +1229,11 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        if not oauth_candidates and not api_key_candidates:
+        if (
+            not oauth_candidates
+            and not api_key_candidates
+            and self._sequence is None
+        ):
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1269,17 +1316,22 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-        )
+        if self._sequence is not None:
+            # Declared by hand, so there is nothing to rank and no "is any
+            # candidate readable" question to answer: the chain named these.
+            ordered, any_known, active_reset_ts = seq_ordered, True, None
+        else:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
 
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -1430,7 +1482,9 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._sequence_note(
+                    num, self._perform(num, email, trigger, left_snapshot)
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1461,7 +1515,9 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._sequence_note(
+                num, self._perform(num, email, trigger, left_snapshot)
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -1860,6 +1916,100 @@ class AutoSwitchEngine:
         return _crossed_window(
             usage_row, self._bars_for(num), self._models, self.settings.threshold
         ) is not None
+
+    @property
+    def sequence(self) -> tuple[str, ...] | None:
+        """The scripted chain this run is walking, or None outside wave mode.
+
+        Public because the TUI has to render what the engine is actually
+        doing: its own panel used to re-derive a headroom ranking and label
+        it "Next best" whatever the engine had been told to do.
+        """
+        return self._sequence
+
+    @property
+    def sequence_position(self) -> int:
+        """Index of the chain element we are sitting on; -1 before the wave
+        has anchored on its head."""
+        return self._seq_pos
+
+    def _sequence_step(
+        self,
+        current: str,
+        usage: dict[str, dict | str | None],
+        over_bar: bool,
+    ) -> tuple[list[str], str]:
+        """This tick's targets for a scripted wave, as ``(ordered, verdict)``.
+
+        ``verdict`` is "" when ``ordered`` is worth acting on, else the reason
+        the wave did nothing: "anchored" (already at the head), "holding" (the
+        active account still has room) or "finished".
+
+        The chain is a script, so every selection rule the usage-aware
+        strategies apply is deliberately absent: no headroom ranking, no
+        hysteresis margin, and no ``_no_return_account`` bar. That bar exists
+        to stop two accounts trading places on their own; here the order was
+        declared by hand, and barring the account we just left would silently
+        eat the element that names it.
+
+        Elements already over their own bars when their turn comes are
+        skipped rather than waited for -- a wave should finish, not stall on
+        one spent account. Several are returned at once, in chain order, so
+        an element whose token turns out to be dead falls through to the next
+        one on the existing activation loop rather than parking the wave.
+        """
+        assert self._sequence is not None
+        chain = self._sequence
+        if self._seq_pos < 0:
+            # Not anchored: the chain declares where the wave starts, so the
+            # head is taken even when the account we are on still has room.
+            if current == chain[0]:
+                self._seq_pos = 0
+            else:
+                return [chain[0]], ""
+        if not over_bar:
+            return [], "holding"
+        ahead = [
+            num
+            for num in chain[self._seq_pos + 1:]
+            if not self._over_bar(num, usage.get(num))
+        ]
+        if ahead:
+            return ahead, ""
+        # Chain exhausted. The head is where the wave parks, but only if it
+        # actually recovered while the wave went round -- hopping onto a
+        # spent account to end on a tidy number would just hand the user a
+        # dead session.
+        if current != chain[0] and not self._over_bar(
+            chain[0], usage.get(chain[0])
+        ):
+            self._seq_finishing = True
+            return [chain[0]], ""
+        return [], "finished"
+
+    def _sequence_detail(
+        self, verdict: str, current: str, settings: AutoSwitchSettings
+    ) -> str:
+        """The line under a wave's NoSwitchEvent."""
+        assert self._sequence is not None
+        chain = " → ".join(self._sequence)
+        if verdict == "finished":
+            return f"chain {chain} complete; parked on Account-{current}"
+        step = f"{self._seq_pos + 1}/{len(self._sequence)}"
+        return f"chain {chain}, at step {step}; Account-{current} still has room"
+
+    def _sequence_note(self, num: str, outcome: TickOutcome) -> TickOutcome:
+        """Record where a wave landed. Pass-through outside sequence mode."""
+        if self._sequence is None or outcome is not TickOutcome.SWITCHED:
+            return outcome
+        if self._seq_finishing:
+            self._seq_done = True
+            return outcome
+        for pos in range(self._seq_pos + 1, len(self._sequence)):
+            if self._sequence[pos] == num:
+                self._seq_pos = pos
+                break
+        return outcome
 
     def _rank_candidates(
         self,
@@ -2459,6 +2609,9 @@ class AutoSwitchEngine:
                     ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                 )
                 outcome = TickOutcome.ERROR
+            if self._seq_done:
+                # The chain is spent: this run had a finite job and did it.
+                return 0
             delay = self._next_delay(outcome)
             if delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)

@@ -1059,11 +1059,12 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, sequence=None):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.sequence = sequence
             type(self).instances.append(self)
 
         def tick(self):
@@ -1094,22 +1095,22 @@ class TestAutoCommand:
         from claude_swap.autoswitch import TickOutcome
 
         self.FakeEngine.tick_outcome = TickOutcome.SWITCHED
-        assert self._run(["--once"], temp_home) == 0
+        assert self._run(["--strategy", "best", "--once"], temp_home) == 0
 
     def test_once_exit_code_no_action(self, temp_home):
         from claude_swap.autoswitch import TickOutcome
 
         self.FakeEngine.tick_outcome = TickOutcome.NO_ACTION
-        assert self._run(["--once"], temp_home) == 2
+        assert self._run(["--strategy", "best", "--once"], temp_home) == 2
 
     def test_once_exit_code_blocked(self, temp_home):
         from claude_swap.autoswitch import TickOutcome
 
         self.FakeEngine.tick_outcome = TickOutcome.BLOCKED
-        assert self._run(["--once"], temp_home) == 3
+        assert self._run(["--strategy", "best", "--once"], temp_home) == 3
 
     def test_loop_mode_returns_loop_exit(self, temp_home):
-        assert self._run([], temp_home) == 0
+        assert self._run(["--strategy", "best"], temp_home) == 0
         assert self.FakeEngine.instances  # loop path constructed the engine
 
     def test_flags_override_settings_json(self, temp_home):
@@ -1121,13 +1122,13 @@ class TestAutoCommand:
             "schemaVersion": 1,
             "autoswitch": {"threshold": 80.0, "cooldownSeconds": 42.0},
         }))
-        self._run(["--once", "--threshold", "60"], temp_home)
+        self._run(["--strategy", "best", "--once", "--threshold", "60"], temp_home)
         engine = self.FakeEngine.instances[-1]
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
     def test_dry_run_forwarded(self, temp_home):
-        self._run(["--once", "--dry-run"], temp_home)
+        self._run(["--strategy", "best", "--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
 
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
@@ -1141,7 +1142,10 @@ class TestAutoCommand:
 
         with patch("claude_swap.autoswitch.AutoSwitchEngine", EmittingEngine), \
              patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(sys, "argv", ["claude-swap", "auto", "--once", "--json"]):
+             patch.object(
+                 sys, "argv",
+                 ["claude-swap", "auto", "--strategy", "best", "--once", "--json"],
+             ):
             with pytest.raises(SystemExit):
                 cli.main()
         lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
@@ -1150,6 +1154,42 @@ class TestAutoCommand:
             payload = json.loads(line)
             assert payload["event"] == "no-switch"
             assert payload["schemaVersion"] == 1
+
+    # -- mode selection and --seq ------------------------------------
+
+    def test_bare_auto_demands_a_mode(self, temp_home, capsys):
+        """A bare `cswap auto` used to start the `best` strategy off an
+        unwritten default — a loop that moves accounts around without anyone
+        having asked for that particular behaviour."""
+        assert self._run([], temp_home) == 1
+        assert "choose a mode" in capsys.readouterr().err
+        assert not self.FakeEngine.instances  # never got as far as an engine
+
+    def test_a_configured_strategy_counts_as_choosing(self, temp_home):
+        """Writing autoswitch.strategy is a choice too, just a standing one."""
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "consume-first"},
+        }))
+        assert self._run(["--once"], temp_home) == 2
+        assert self.FakeEngine.instances
+
+    def test_seq_cannot_ride_with_once(self, temp_home, capsys):
+        """A wave's position lives in the running process, so a single tick
+        has nowhere to remember it."""
+        assert self._run(["--seq", "1", "2", "--once"], temp_home) == 2
+        assert "--seq cannot be combined with --once" in capsys.readouterr().err
+
+    def test_an_unknown_account_in_seq_fails_before_the_wave_starts(
+        self, temp_home, capsys
+    ):
+        """A typo in a wave script must fail loudly, not silently shorten the
+        wave by one element."""
+        assert self._run(["--seq", "nope@example.com"], temp_home) == 1
+        assert not self.FakeEngine.instances
 
     def test_unknown_flag_errors(self, temp_home, capsys):
         with patch.object(sys, "argv", ["claude-swap", "auto", "--bogus"]):

@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,7 @@ from textual.widgets import Footer, RichLog, Static
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _seven_day_reset_ts,
     binding_pct,
     pct_label,
 )
@@ -138,7 +140,26 @@ class AutoScreen(Screen):
 
     # -- threshold adjust mode ------------------------------------------------
 
+    @property
+    def _chain(self) -> tuple[str, ...]:
+        """The wave's chain, or empty. Tolerates a screen with no engine yet."""
+        engine = getattr(self, "_engine", None)
+        return tuple(getattr(engine, "sequence", None) or ())
+
+    @property
+    def _chain_position(self) -> int:
+        engine = getattr(self, "_engine", None)
+        return getattr(engine, "sequence_position", -1)
+
     def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action in ("adjust_threshold", "threshold_step", "adjust_done") and (
+            self._chain
+        ):
+            # A wave leaves on the same thresholds, but the knob offers a
+            # single number while the decision now reads one bar per window —
+            # and the wave's own driver is the chain. Offering the slider here
+            # would suggest it steers something it does not.
+            return False
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
         return True
@@ -193,12 +214,20 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
-        text.append(
-            f"threshold {pct_label(self._settings.threshold)}%",
-            style=palette.accent if self._adjusting else "",
-        )
-        if self._settings.threshold != self._configured_threshold:
-            text.append(" (session)", style=palette.muted)
+        chain = self._chain
+        if chain:
+            position = self._chain_position
+            text.append(
+                f"chain {' → '.join(chain)}"
+                + (f" · step {position + 1}/{len(chain)}" if position >= 0 else "")
+            )
+        else:
+            text.append(
+                f"threshold {pct_label(self._settings.threshold)}%",
+                style=palette.accent if self._adjusting else "",
+            )
+            if self._settings.threshold != self._configured_threshold:
+                text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
@@ -214,6 +243,10 @@ class AutoScreen(Screen):
             dry_run=dry_run,
         )
         self._engine = engine
+        # The summary was drawn on mount, before there was an engine to
+        # describe — redraw it now that one exists, or a wave would be
+        # reported as a threshold loop for as long as the screen is open.
+        self._update_summary()
         self.run_worker(
             engine.run_loop,
             thread=True,
@@ -291,14 +324,73 @@ class AutoScreen(Screen):
             self._candidates_text(snap, active_number=snap.active_number)
         )
 
+    def _sequence_text(
+        self, snap: AccountsSnapshot, active_number: str | None
+    ) -> Text:
+        """The declared chain, in its own order, with the wave's position.
+
+        A ranking would be a lie here: the user wrote the order, and the only
+        question the panel can usefully answer is how far along it is. Spent
+        elements are marked because the wave skips them rather than waiting,
+        so seeing one greyed out explains a jump that would otherwise look
+        like the order being ignored.
+        """
+        palette = Palette.from_theme(self.app.current_theme)
+        models = parse_model_names(self._settings.model) if self._settings else ()
+        chain = self._chain
+        position = self._chain_position
+        by_number = {acc.number: acc for acc in snap.accounts}
+
+        text = Text()
+        text.append("Chain", style=palette.muted)
+        for index, number in enumerate(chain):
+            acc = by_number.get(number)
+            marker = "▸" if index == position else " "
+            entry = Text()
+            entry.append(f"\n {marker} {number:>2}  ", style=palette.foreground)
+            if acc is None:
+                entry.append("not in this install", style=palette.muted)
+                text.append(entry)
+                continue
+            entry.append(acc.email, style=palette.foreground)
+            pct = binding_pct(acc.usage.last_good, models)
+            if acc.usage.sentinel is not None:
+                entry.append(
+                    f"  {data.sentinel_label(acc.usage.sentinel)}",
+                    style=palette.muted,
+                )
+            elif pct is None:
+                entry.append("  usage unknown", style=palette.muted)
+            else:
+                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+            if index < position:
+                entry.append("  done", style=palette.muted)
+            elif number == active_number:
+                entry.append("  here", style=palette.muted)
+            text.append(entry)
+        return text
+
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by remaining headroom (best first)."""
+        """What the engine will actually do next.
+
+        This panel used to re-derive a headroom ranking and label it "Next
+        best" no matter what the engine had been told to do — already wrong
+        under ``consume-first``, which ranks by weekly reset, and wrong in a
+        different way under a scripted wave, where there is no ranking at all
+        and the order was declared by hand. Each mode now renders itself.
+        """
+        if self._chain:
+            return self._sequence_text(snap, active_number)
         # Same window set as the engine (autoswitch.model included), so the
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
+        consume_first = (
+            self._settings is not None
+            and self._settings.strategy == "consume-first"
+        )
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
@@ -318,11 +410,24 @@ class AutoScreen(Screen):
                 ranked.append((999.0, acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                ranked.append((pct, acc.number))
+                if consume_first:
+                    # The strategy spends the most perishable quota first, so
+                    # the soonest weekly reset leads and unknown resets sort
+                    # last — the engine's own key, not a second opinion.
+                    reset_ts = _seven_day_reset_ts(acc.usage.last_good, time.time())
+                    ranked.append(
+                        (reset_ts if reset_ts is not None else float("inf"),
+                         acc.number)
+                    )
+                else:
+                    ranked.append((pct, acc.number))
             lines[acc.number] = entry
 
         text = Text()
-        text.append("Next best", style=palette.muted)
+        text.append(
+            "Next by weekly reset" if consume_first else "Next best",
+            style=palette.muted,
+        )
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text

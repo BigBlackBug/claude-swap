@@ -98,6 +98,14 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
+- **Pick a mode.** `cswap auto` no longer starts on an unwritten default: pass `--seq` for one scripted wave, or `--strategy` to let it choose targets by usage (writing `autoswitch.strategy` in settings.json counts as choosing, so a standing default still works).
+- **Scripted wave** (`--seq`): you declare the order, the thresholds still decide when to leave each account.
+
+  ```bash
+  cswap auto --seq 2 3 1          # numbers, aliases or emails
+  ```
+
+  Walks the chain from its head — switching there first even if the account you are on still has room — leaves each account when it reaches its threshold, and **skips** any element already spent when its turn comes, so a wave finishes rather than stalling. When the chain runs out it parks on the head (only if that account recovered meanwhile) and **exits**. The list length is the number of switches: repeat an account to visit it twice, e.g. `--seq 2 3 2 3 1`. The position lives in the running process, so `--seq` cannot be combined with `--once`.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).

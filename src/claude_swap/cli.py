@@ -573,6 +573,26 @@ Examples:
         sys.exit(130)
 
 
+def _auto_mode_is_explicit(args, switcher) -> bool:
+    """Whether the user actually chose how ``cswap auto`` should pick targets.
+
+    A bare ``cswap auto`` used to start the ``best`` strategy off an unwritten
+    default — a loop that moves accounts around without anyone having asked
+    for that particular behaviour. A flag counts as asking, and so does a
+    strategy written into settings.json: that is a choice too, just a
+    standing one.
+    """
+    if getattr(args, "strategy", None):
+        return True
+    from claude_swap.settings import effective_settings
+
+    return any(
+        is_set
+        for spec, _value, is_set in effective_settings(switcher.backup_dir)
+        if spec.dotted == "autoswitch.strategy"
+    )
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -673,6 +693,20 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--seq",
+        nargs="+",
+        metavar="ACCOUNT",
+        default=None,
+        help=(
+            "Run one scripted wave: walk these accounts in this order, "
+            "leaving each when it reaches its threshold, then park on the "
+            "first one and exit. Accepts numbers, aliases or emails. Repeat "
+            "an account to visit it twice (the list length is the number of "
+            "switches). Position is held in memory, so it cannot be combined "
+            "with --once"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Evaluate and report, but never switch or write state",
@@ -683,6 +717,11 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Enable debug logging",
     )
     args = parser.parse_args(argv)
+    if args.seq and args.once:
+        parser.error(
+            "--seq cannot be combined with --once: a wave's position lives in "
+            "the running process, so a single tick has nowhere to remember it"
+        )
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
@@ -710,11 +749,31 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+
+        sequence: tuple[str, ...] | None = None
+        if args.seq:
+            # Resolved before the first tick: a typo in a wave script must
+            # fail loudly, not silently shorten the wave. Duplicates are kept
+            # — repeating an account is how you ask to visit it twice.
+            sequence = tuple(
+                switcher.resolve_account(item)[0] for item in args.seq
+            )
+        elif not _auto_mode_is_explicit(args, switcher):
+            error(
+                "Error: choose a mode — '--seq <accounts...>' to run one "
+                "scripted wave, or '--strategy best|consume-first' to let "
+                "cswap pick targets by usage.\n"
+                "Set autoswitch.strategy in settings.json to make a strategy "
+                "the standing default."
+            )
+            sys.exit(1)
+
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            sequence=sequence,
         )
 
         if args.once:
@@ -725,9 +784,15 @@ Defaults live in settings.json in the backup root; flags override them.
         if not args.json:
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
-                    f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
+                    (
+                        f"Auto-switch wave: {' → '.join(sequence)}, "
+                        f"every {settings.interval_seconds:.0f}s"
+                        if sequence
+                        else f"Auto-switch running: threshold "
+                        f"{settings.threshold:.0f}%, "
+                        f"every {settings.interval_seconds:.0f}s"
+                    )
+                    + f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
         sys.exit(engine.run_loop())

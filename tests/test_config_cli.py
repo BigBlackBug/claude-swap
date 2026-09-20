@@ -257,7 +257,7 @@ class TestConfigMisc:
 
         class FakeEngine:
             def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                         state_path=None, clock=None):
+                         state_path=None, clock=None, sequence=None):
                 captured["settings"] = settings
 
             def tick(self):
@@ -267,7 +267,10 @@ class TestConfigMisc:
 
         with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
              patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
+             patch.object(
+                 sys, "argv",
+                 ["claude-swap", "auto", "--strategy", "best", "--once"],
+             ):
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0

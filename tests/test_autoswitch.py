@@ -2782,6 +2782,111 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+class TestSequenceWave:
+    """`cswap auto --seq 2 3 1` — a scripted wave.
+
+    Thresholds still decide WHEN to leave; the chain decides WHERE to go, and
+    the run has a finite job: walk the chain once, park, exit. Everything the
+    usage-aware strategies do to pick a target — headroom ranking, the
+    hysteresis margin, the no-return bar — is deliberately absent, because the
+    order was declared by hand.
+    """
+
+    def _harness(self, temp_home: Path, chain=("2", "3", "1"), **kwargs):
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine = h._make_engine(sequence=chain)
+        return h
+
+    def test_the_chain_declares_where_the_wave_starts(self, temp_home):
+        """Account 1 has plenty of room, but the chain starts at 2 — so the
+        wave's first act is to go there. Otherwise "park on the head at the
+        end" would have no anchor to be an end of."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_wave_holds_while_the_active_account_has_room(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(50, 50), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_an_element_over_its_bar_is_skipped(self, temp_home):
+        """A wave should finish, not stall on one spent account: 3 is already
+        past its bar when its turn comes, so the chain moves on to 1."""
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(99, 99),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_the_account_just_left_can_be_the_next_element(self, temp_home):
+        """The no-return bar exists to stop two accounts trading places on
+        their own. Here the order is a script, so barring the account we just
+        left would silently eat the element that names it."""
+        h = self._harness(temp_home, chain=("2", "1", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        assert h.active_number() == 2      # anchored, having left 1
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1      # straight back to the account we left
+
+    def test_exhausted_chain_parks_on_the_head_that_recovered(self, temp_home):
+        h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5)})
+        assert h.active_number() == 3
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(95, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2      # back to the head
+        assert h.engine._seq_done is True  # and the run is over
+
+    def test_exhausted_chain_stays_put_when_the_head_is_still_spent(
+        self, temp_home,
+    ):
+        """Hopping onto a spent account to end on a tidy number would hand
+        the user a dead session."""
+        h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5)})
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(99, 99), "3": _usage7(95, 5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+        assert h.engine._seq_done is True
+
+    def test_a_repeated_element_is_visited_twice(self, temp_home):
+        """The list length is the switch count — repeating an account is how
+        you ask for another pass over it."""
+        h = self._harness(temp_home, chain=("2", "3", "2"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5)})
+        assert h.active_number() == 3
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(95, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine._seq_done is False  # the third element, not the finish
+
+
 class TestPerWindowThresholds:
     """One bar per window instead of one bar over the binding window.
 

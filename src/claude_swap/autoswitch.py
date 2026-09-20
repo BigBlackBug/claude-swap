@@ -51,7 +51,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    load_account_thresholds,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -528,6 +533,90 @@ def _window_pcts(
     }
 
 
+def _window_bars(
+    settings: AutoSwitchSettings,
+    overrides: dict[str, dict[str, float]],
+    num: str,
+) -> dict[str, float]:
+    """The pct bar each of ONE account's windows must stay under.
+
+    Three layers, narrowest first: that account's own override, then the
+    account-wide per-window value, then the single binding bar. Unset at
+    every layer lands on ``threshold``, which is what keeps the per-window
+    feature invisible — and the engine's behaviour bit-identical — until
+    somebody configures it.
+
+    Model windows are deliberately absent: a per-model weekly limit is a
+    different axis from the account's own 5h/7d, so it keeps reading the
+    binding bar until someone asks for a knob of its own.
+    """
+    row = overrides.get(num, {})
+    shared = settings.threshold
+
+    def bar(own_key: str, account_wide: float | None) -> float:
+        value = row.get(own_key)
+        if value is not None:
+            return value
+        return account_wide if account_wide is not None else shared
+
+    return {
+        "5h": bar("threshold5h", settings.threshold_5h),
+        "7d": bar("threshold7d", settings.threshold_7d),
+    }
+
+
+def _crossed_window(
+    usage: dict | str | None,
+    bars: dict[str, float],
+    models: tuple[str, ...],
+    shared: float,
+) -> tuple[str, float, float] | None:
+    """The first window at or over its own bar, as ``(name, pct, bar)``.
+
+    With every bar equal to ``threshold`` this is exactly the old binding
+    comparison: utilization IS the maximum window pct, so "the max is at the
+    bar" and "some window is at the bar" answer the same question. They part
+    company only once the bars differ, which is the whole point — a spent
+    weekly window can then release an account whose 5h window is untouched,
+    and a fresh 5h window stops dragging a spent weekly one along.
+    """
+    if not isinstance(usage, dict):
+        return None
+    for name, pct in _window_pcts(usage, models).items():
+        if pct >= bars.get(name, shared):
+            return name, pct, bars.get(name, shared)
+    return None
+
+
+def _below_bar_detail(
+    usage: dict | str | None,
+    bars: dict[str, float],
+    models: tuple[str, ...],
+    utilization: float,
+    settings: AutoSwitchSettings,
+) -> str:
+    """The "why we stayed" line under a NoSwitchEvent.
+
+    Uniform bars keep the historical wording — both sides through
+    ``pct_label``, because a ``.0f`` utilization could otherwise display an
+    impossible "100% < 99.9%". Once the bars differ the bare pair stops
+    being readable ("83% < 90%" says nothing about WHICH 90), so the window
+    that came closest to its own bar is named instead.
+    """
+    uniform = set(bars.values()) == {settings.threshold}
+    pcts = _window_pcts(usage, models) if isinstance(usage, dict) else {}
+    if uniform or not pcts:
+        return (
+            f"{pct_label(utilization)}% < {pct_label(settings.threshold)}%"
+        )
+    name, pct = max(
+        pcts.items(),
+        key=lambda kv: kv[1] - bars.get(kv[0], settings.threshold),
+    )
+    bar = bars.get(name, settings.threshold)
+    return f"{name} {pct_label(pct)}% < {pct_label(bar)}%"
+
+
 # Reset math moved to poll_policy with the cadence numbers; aliased for the
 # engine's sleep scheduling and the test suite.
 _limiting_reset_ts = poll_policy.limiting_reset_ts
@@ -656,6 +745,11 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # Per-account threshold overrides, read once per engine rather than
+        # per tick: they live in the same settings.json the caller already
+        # loaded ``settings`` from, and a tick that re-read the file would
+        # decide on a different configuration than the one it reported.
+        self._account_bars = load_account_thresholds(switcher.backup_dir)
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -977,16 +1071,17 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            bars = self._bars_for(current)
+            if _crossed_window(
+                usage.get(current), bars, self._models, settings.threshold
+            ) is None:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
-                            # Both sides through pct_label: .0f utilization could
-                            # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                            detail=_below_bar_detail(
+                                usage.get(current), bars, self._models,
+                                utilization, settings,
                             ),
                         )
                     )
@@ -1752,6 +1847,20 @@ class AutoSwitchEngine:
             < was - RECOVERY_HYSTERESIS_S
         )
 
+    def _bars_for(self, num: str) -> dict[str, float]:
+        """This account's per-window bars — see :func:`_window_bars`."""
+        return _window_bars(self.settings, self._account_bars, num)
+
+    def _over_bar(self, num: str, usage_row: dict | str | None) -> bool:
+        """Whether any of this account's windows is at or over its own bar.
+
+        The per-window replacement for ``(100 - headroom) >= threshold``, and
+        identical to it whenever the bars are left alone.
+        """
+        return _crossed_window(
+            usage_row, self._bars_for(num), self._models, self.settings.threshold
+        ) is not None
+
     def _rank_candidates(
         self,
         *,
@@ -1848,7 +1957,7 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if self._over_bar(num, usage.get(num)) and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below

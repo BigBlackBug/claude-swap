@@ -275,6 +275,17 @@ cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config unset autoswitch.threshold   # back to the default
+
+# One bar per window instead of one over the binding (max) window.
+# Unset, both fall back to autoswitch.threshold.
+cswap config set autoswitch.threshold5h 98   # spend the 5h window hard
+cswap config set autoswitch.threshold7d 85   # but get off a mostly-spent week
+
+# Per account, beating both of the above. Burn the personal account,
+# spare the work one.
+cswap config set autoswitch.account.1.threshold7d 95
+cswap config set autoswitch.account.2.threshold7d 60
+cswap config unset autoswitch.account.2.threshold7d
 cswap config path                         # where settings.json lives
 ```
 

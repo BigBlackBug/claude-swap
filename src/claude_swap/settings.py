@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -41,9 +42,21 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
     ping-pong while a strictly better account is always taken.
+
+    ``threshold_5h`` and ``threshold_7d`` split that single bar per window.
+    Unset (None) means "use ``threshold``", which keeps the binding-window
+    behaviour above byte-identical for anyone who never sets them. Set, they
+    are read per window: the engine leaves when ANY window reaches its own
+    bar, so a 1%-used 5h window no longer holds an account whose weekly quota
+    is spent, and a full weekly window no longer drags on a fresh 5h one.
+    Per-account overrides live under ``autoswitch.account.<slot>`` and beat
+    both (see :func:`load_account_thresholds`) -- one account can be burned to
+    98% while another is held back at 60%.
     """
 
     threshold: float = 90.0
+    threshold_5h: float | None = None
+    threshold_7d: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -70,6 +83,9 @@ class UiSettings:
 _SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
 
 
+_NO_DEFAULT = object()
+
+
 @dataclass(frozen=True)
 class SettingSpec:
     """Metadata for one user-tunable settings.json key.
@@ -87,13 +103,25 @@ class SettingSpec:
     hi: float | None = None
     choices: tuple[str, ...] = ()
     help: str = ""
+    # Intermediate JSON keys between the section and ``json_key``, for keys
+    # that live in a nested object rather than flat in the section (today:
+    # ``autoswitch.account.<slot>.*``). Empty for every registry key, so the
+    # flat read/write paths below are unchanged for them.
+    nested: tuple[str, ...] = ()
+    # A default that does NOT come from a dataclass field. Keys synthesized
+    # for a parameterized family have no field to read one off, and the
+    # sentinel (rather than None) keeps "no default recorded" distinct from
+    # "the default is None", which is a real value for the threshold keys.
+    explicit_default: object = _NO_DEFAULT
 
     @property
     def dotted(self) -> str:
-        return f"{self.section}.{self.json_key}"
+        return ".".join((self.section, *self.nested, self.json_key))
 
     @property
     def default(self):
+        if self.explicit_default is not _NO_DEFAULT:
+            return self.explicit_default
         return getattr(_SECTION_DEFAULT_SOURCES[self.section](), self.field)
 
 
@@ -105,6 +133,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold5h", "threshold_5h", "float", 50.0, 99.9,
+            help="Switch when the 5h window alone reaches this pct "
+                 "(unset: use threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold7d", "threshold_7d", "float", 50.0, 99.9,
+            help="Switch when the 7d window alone reaches this pct "
+                 "(unset: use threshold)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -147,6 +185,39 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
     for spec in SETTING_SPECS.values()
     if spec.section == "autoswitch"
 }
+
+# Per-account threshold overrides: ``autoswitch.account.<slot>.threshold5h``.
+#
+# Deliberately NOT in SETTING_SPECS. That registry is a fixed list which
+# `effective_settings`, the config CLI and the TUI all enumerate; a family
+# whose membership depends on which accounts exist cannot be enumerated ahead
+# of time, and stuffing it in would also break the registry's one-key-to-one-
+# dataclass-field invariant. `setting_spec` synthesizes a member on demand
+# from the matching global spec instead, so bounds, parsing and help text
+# cannot drift between an account's override and the account-wide key.
+_ACCOUNT_THRESHOLD_KEYS = ("threshold5h", "threshold7d")
+_ACCOUNT_KEY_RE = re.compile(
+    r"^autoswitch\.account\.(\d+)\.(" + "|".join(_ACCOUNT_THRESHOLD_KEYS) + r")$"
+)
+
+
+def _account_setting_spec(dotted_key: str) -> SettingSpec | None:
+    """Synthesize the spec for one per-account override, or None if the key
+    is not a member of the family."""
+    match = _ACCOUNT_KEY_RE.match(dotted_key)
+    if match is None:
+        return None
+    slot, json_key = match.group(1), match.group(2)
+    base = SETTING_SPECS[f"autoswitch.{json_key}"]
+    window = json_key.removeprefix("threshold")
+    return dataclasses.replace(
+        base,
+        nested=("account", slot),
+        # Unset means "fall back to the account-wide value", which is exactly
+        # what None means for the global keys too.
+        explicit_default=None,
+        help=f"Account {slot}'s own {window} bar (unset: use the shared one)",
+    )
 
 
 def settings_path(backup_root: Path) -> Path:
@@ -264,13 +335,46 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
 
 def setting_spec(dotted_key: str) -> SettingSpec:
     """Look up a spec by dotted key; unknown keys raise with the valid list."""
-    spec = SETTING_SPECS.get(dotted_key)
+    spec = SETTING_SPECS.get(dotted_key) or _account_setting_spec(dotted_key)
     if spec is None:
         raise ConfigError(
             f"unknown setting '{dotted_key}'\n"
-            f"Valid keys: {', '.join(SETTING_SPECS)}"
+            f"Valid keys: {', '.join(SETTING_SPECS)}\n"
+            "Per-account overrides: autoswitch.account.<slot>."
+            + ", autoswitch.account.<slot>.".join(_ACCOUNT_THRESHOLD_KEYS)
         )
     return spec
+
+
+def load_account_thresholds(backup_root: Path) -> dict[str, dict[str, float]]:
+    """Per-account threshold overrides as ``{slot: {json_key: pct}}``.
+
+    Clamped through the same spec bounds as the account-wide keys, and
+    lenient in the same way the rest of the loader is: a malformed slot or
+    value is skipped rather than raising, so one bad hand edit cannot stop
+    the engine from starting. Absent keys are simply absent -- the caller
+    falls back to the account-wide value rather than to a default recorded
+    here, so a later change to that value still reaches accounts that never
+    overrode it.
+    """
+    section = _read_raw(settings_path(backup_root)).get("autoswitch")
+    accounts = section.get("account") if isinstance(section, dict) else None
+    if not isinstance(accounts, dict):
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for slot, values in accounts.items():
+        if not isinstance(values, dict):
+            continue
+        row: dict[str, float] = {}
+        for json_key in _ACCOUNT_THRESHOLD_KEYS:
+            value = values.get(json_key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            base = SETTING_SPECS[f"autoswitch.{json_key}"]
+            row[json_key] = float(min(max(value, base.lo), base.hi))
+        if row:
+            out[str(slot)] = row
+    return out
 
 
 _BOOL_WORDS = {
@@ -379,8 +483,15 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     section = raw.get(spec.section)
     if not isinstance(section, dict):
         section = {}
-    section[spec.json_key] = value
     raw[spec.section] = section
+    target = section
+    for key in spec.nested:
+        child = target.get(key)
+        if not isinstance(child, dict):
+            child = {}
+        target[key] = child
+        target = child
+    target[spec.json_key] = value
     atomic_write_json(path, raw)
     return value
 
@@ -391,10 +502,25 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     path = settings_path(backup_root)
     raw = _read_raw_for_write(path)
     section = raw.get(spec.section)
-    if not isinstance(section, dict) or spec.json_key not in section:
+    if not isinstance(section, dict):
+        return False
+    # The containers on the way down, outermost first, so emptied ones can be
+    # pruned on the way back up: an `account` object left holding an empty
+    # slot would show up in the file as configuration that isn't there.
+    chain = [section]
+    for key in spec.nested:
+        child = chain[-1].get(key)
+        if not isinstance(child, dict):
+            return False
+        chain.append(child)
+    if spec.json_key not in chain[-1]:
         return False
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    del section[spec.json_key]
+    del chain[-1][spec.json_key]
+    for depth in range(len(spec.nested), 0, -1):
+        if chain[depth]:
+            break
+        del chain[depth - 1][spec.nested[depth - 1]]
     if not section:
         del raw[spec.section]
     atomic_write_json(path, raw)
@@ -418,6 +544,14 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
         rows.append((spec, getattr(loaded[spec.section], spec.field), is_set))
+    # Per-account overrides are listed only where they exist: the family has
+    # no fixed membership, and printing an "unset" row for every slot x window
+    # would bury the account-wide keys under rows nobody wrote.
+    for slot, values in sorted(load_account_thresholds(backup_root).items()):
+        for json_key in _ACCOUNT_THRESHOLD_KEYS:
+            if json_key in values:
+                spec = setting_spec(f"autoswitch.account.{slot}.{json_key}")
+                rows.append((spec, values[json_key], True))
     return rows
 
 

@@ -17,6 +17,7 @@ from claude_swap.settings import (
     AutoSwitchSettings,
     UiSettings,
     effective_settings,
+    load_account_thresholds,
     load_settings,
     load_ui_settings,
     merged_with_cli,
@@ -249,6 +250,100 @@ class TestEffectiveSettings:
         by_key = {spec.dotted: is_set for spec, _, is_set in effective_settings(tmp_path)}
         assert by_key["autoswitch.threshold"] is True
         assert by_key["autoswitch.intervalSeconds"] is False
+
+
+class TestPerWindowThresholds:
+    """threshold5h / threshold7d split the single binding-window bar.
+
+    Unset they must stay None, because None is what tells the engine to keep
+    reading `threshold` — recording a number here instead would silently pin
+    every user to today's default.
+    """
+
+    def test_unset_windows_stay_none(self, tmp_path: Path):
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold_5h is None
+        assert loaded.threshold_7d is None
+        assert loaded.threshold == 90.0
+
+    def test_windows_round_trip_independently(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.threshold5h", "95")
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold_5h == 95.0
+        assert loaded.threshold_7d is None  # untouched sibling
+
+    def test_window_value_is_clamped_like_the_shared_bar(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps(
+            {"autoswitch": {"threshold5h": 250}}
+        ))
+        assert load_settings(tmp_path).threshold_5h == 99.9
+
+
+class TestPerAccountThresholds:
+    """`autoswitch.account.<slot>.*` — a family with no fixed membership.
+
+    Synthesized on demand from the account-wide spec, so bounds and parsing
+    cannot drift, and stored nested so the file reads as configuration rather
+    than as a flat key with dots in its name.
+    """
+
+    def test_set_writes_a_nested_object(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.account.2.threshold7d", "60")
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["autoswitch"]["account"]["2"]["threshold7d"] == 60.0
+
+    def test_load_reports_overrides_by_slot(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.account.2.threshold7d", "60")
+        set_setting(tmp_path, "autoswitch.account.4.threshold5h", "98")
+        assert load_account_thresholds(tmp_path) == {
+            "2": {"threshold7d": 60.0},
+            "4": {"threshold5h": 98.0},
+        }
+
+    def test_override_does_not_leak_into_the_shared_keys(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.account.2.threshold7d", "60")
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold_7d is None
+        assert loaded.threshold == 90.0
+
+    def test_bounds_come_from_the_shared_spec(self, tmp_path: Path):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "autoswitch.account.2.threshold7d", "250")
+
+    def test_a_malformed_slot_is_skipped_not_fatal(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {"account": {
+            "2": {"threshold7d": "nonsense"},
+            "4": {"threshold5h": 98},
+            "9": "not-an-object",
+        }}}))
+        # One bad hand edit must not stop the engine from starting.
+        assert load_account_thresholds(tmp_path) == {"4": {"threshold5h": 98.0}}
+
+    def test_unset_prunes_the_containers_it_emptied(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.account.2.threshold7d", "60")
+        assert unset_setting(tmp_path, "autoswitch.account.2.threshold7d") is True
+        raw = json.loads(settings_path(tmp_path).read_text())
+        # An `account` object holding an empty slot would read as config
+        # that is not actually there.
+        assert "account" not in raw.get("autoswitch", {})
+
+    def test_unset_keeps_a_sibling_slot(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.account.2.threshold7d", "60")
+        set_setting(tmp_path, "autoswitch.account.4.threshold5h", "98")
+        unset_setting(tmp_path, "autoswitch.account.2.threshold7d")
+        assert load_account_thresholds(tmp_path) == {"4": {"threshold5h": 98.0}}
+
+    def test_unknown_member_of_the_family_is_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError) as e:
+            set_setting(tmp_path, "autoswitch.account.2.cooldownSeconds", "10")
+        assert "autoswitch.account.<slot>" in str(e.value)
+
+    def test_overrides_are_listed_only_where_they_exist(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.account.2.threshold7d", "60")
+        rows = effective_settings(tmp_path)
+        by_key = {spec.dotted: (value, is_set) for spec, value, is_set in rows}
+        assert by_key["autoswitch.account.2.threshold7d"] == (60.0, True)
+        assert "autoswitch.account.4.threshold7d" not in by_key
 
 
 class TestMergedWithCli:

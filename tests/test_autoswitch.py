@@ -33,7 +33,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, settings_path
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -2780,6 +2780,148 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     if reset7:
         seven["resets_at"] = reset7
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
+
+
+class TestPerWindowThresholds:
+    """One bar per window instead of one bar over the binding window.
+
+    The binding window is the MAXIMUM of 5h and 7d, so a single number has to
+    serve two quantities that behave nothing alike: the 5h window recycles
+    several times a day, the weekly one is the perishable quota. At 5h=1% /
+    7d=91% the old bar fires on the weekly window while the 5h one is
+    untouched, and there is no way to say "spend the 5h window to 98, but get
+    off an account whose week is 85% gone".
+    """
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_unset_bars_reproduce_the_binding_comparison(self, temp_home):
+        """The feature must be invisible until configured: same inputs, same
+        verdict as the single-threshold engine."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10), "2": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED  # 95 >= the shared 90
+        assert h.active_number() == 2
+
+    def test_a_loose_5h_bar_holds_an_account_the_shared_bar_would_release(
+        self, temp_home,
+    ):
+        h = self._harness(temp_home, threshold_5h=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 10), "2": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "below-threshold"
+        ]
+
+    def test_a_tight_7d_bar_releases_an_account_the_shared_bar_would_hold(
+        self, temp_home,
+    ):
+        h = self._harness(temp_home, threshold_7d=85.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 86), "2": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED  # 86 < the shared 90, >= its own
+        assert h.active_number() == 2
+
+    def test_the_windows_are_read_independently(self, temp_home):
+        """A spent weekly window must not be rescued by a fresh 5h one."""
+        h = self._harness(temp_home, threshold_5h=98.0, threshold_7d=85.0)
+        assert h.tick_with_usage({
+            "1": _usage7(1, 91), "2": _usage7(5, 5),
+        }) is TickOutcome.SWITCHED
+
+    def test_a_candidate_over_its_own_bar_is_not_a_landing_site(
+        self, temp_home,
+    ):
+        """Landing on an account that is itself over the bar would re-trigger
+        next tick — the gate has to read the candidate's bars, not the
+        shared one."""
+        h = self._harness(temp_home, threshold_7d=85.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 86),   # must leave
+            "2": _usage7(10, 88),   # under the shared 90, over its own 85
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_distinct_bars_name_the_window_in_the_detail(self, temp_home):
+        """"83% < 90%" stops being readable once there are several 90s."""
+        h = self._harness(temp_home, threshold_7d=85.0)
+        h.tick_with_usage({"1": _usage7(10, 80), "2": _usage7(5, 5)})
+        detail = next(
+            e.detail for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "below-threshold"
+        )
+        assert detail.startswith("7d ")
+        assert "85%" in detail
+
+    def test_uniform_bars_keep_the_historical_detail_wording(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": _usage7(10, 20), "2": _usage7(5, 5)})
+        detail = next(
+            e.detail for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "below-threshold"
+        )
+        assert detail == "20% < 90%"
+
+
+class TestPerAccountThresholds:
+    """`autoswitch.account.<slot>` — one account burned hard, another spared."""
+
+    def _harness(self, temp_home: Path, overrides: dict) -> EngineHarness:
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        settings_path(h.switcher.backup_dir).write_text(
+            json.dumps({"autoswitch": {"account": overrides}})
+        )
+        # The engine reads the overrides once, at construction.
+        h.engine = h._make_engine()
+        return h
+
+    def test_an_override_loosens_only_its_own_account(self, temp_home):
+        h = self._harness(temp_home, {"1": {"threshold5h": 98}})
+        assert h.tick_with_usage({
+            "1": _usage7(95, 10), "2": _usage7(5, 5),
+        }) is TickOutcome.NO_ACTION
+
+    def test_an_override_tightens_only_its_own_account(self, temp_home):
+        h = self._harness(temp_home, {"1": {"threshold7d": 85}})
+        assert h.tick_with_usage({
+            "1": _usage7(10, 86), "2": _usage7(5, 5),
+        }) is TickOutcome.SWITCHED
+
+    def test_a_candidate_reads_its_own_override_not_the_active_one(
+        self, temp_home,
+    ):
+        """Account 2 is spared at 60: it must not be a landing site at 70%
+        even though the active account's own bar would allow it."""
+        h = self._harness(temp_home, {"2": {"threshold7d": 60}})
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 95),   # over the shared 90, must leave
+            "2": _usage7(10, 70),   # under 90, over its own 60
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_an_account_without_an_override_keeps_the_shared_bars(
+        self, temp_home,
+    ):
+        h = self._harness(temp_home, {"2": {"threshold7d": 60}})
+        assert h.tick_with_usage({
+            "1": _usage7(10, 80), "2": _usage7(5, 5),
+        }) is TickOutcome.NO_ACTION
 
 
 class TestConsumeFirstStrategy:

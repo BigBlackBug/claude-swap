@@ -81,10 +81,10 @@ class EngineHarness:
     def __init__(self, temp_home: Path, **settings_kwargs):
         self.temp_home = temp_home
         # get_backup_root() (switcher.py) resolves via Path.home() on every
-        # platform (both its XDG branch and its legacy
-        # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
-        # but on LINUX/WSL, $XDG_DATA_HOME takes precedence over Path.home()
-        # when set (paths.py:102-106). Patching Path.home() alone is not a
+        # platform (both its XDG branch and the legacy
+        # get_legacy_backup_root() branch Windows still takes honour it) —
+        # but everywhere but Windows, $XDG_DATA_HOME takes precedence over
+        # Path.home() when set. Patching Path.home() alone is not a
         # superset of patching $XDG_DATA_HOME alone: a developer/CI with
         # XDG_DATA_HOME exported would have every EngineHarness's XDG branch
         # resolve to that ONE ambient value regardless of Path.home(),
@@ -208,17 +208,18 @@ class TestEngineHarnessIsolation:
     accounts' stores into one without any assertion noticing.
 
     An earlier fix scoped isolation on `$XDG_DATA_HOME`, which
-    `get_backup_root()` only consults on LINUX/WSL (paths.py:101) — so
-    the guard's OWN skipif, added because the mechanism is genuinely absent
-    off Linux, also left the guard itself untested there (measured: skip
-    forced + scoping reverted, full suite SURVIVED). The aliasing it
-    guards against is real off Linux (direct probe: two harnesses on
-    distinct subtrees collapsed to one store under the legacy
-    ~/.claude-swap-backup path, and h1's seeded account silently became
-    h2's). `Path.home()` is honoured by get_backup_root() on EVERY platform
-    (both its XDG branch and its `get_legacy_backup_root()` fallback —
-    paths.py:101-108), so scoping there instead makes the guard, and this
-    test, load-bearing everywhere and lets the skipif be deleted.
+    `get_backup_root()` did not consult off Linux/WSL at the time — so
+    the guard's OWN skipif, added because the mechanism was genuinely absent
+    there, also left the guard itself untested (measured: skip forced +
+    scoping reverted, full suite SURVIVED). The aliasing it guards against
+    was real off Linux (direct probe: two harnesses on distinct subtrees
+    collapsed to one store under the legacy ~/.claude-swap-backup path, and
+    h1's seeded account silently became h2's). `Path.home()` is honoured by
+    get_backup_root() on EVERY platform (both its XDG branch and the
+    `get_legacy_backup_root()` branch Windows still takes), so scoping there
+    instead makes the guard, and this test, load-bearing everywhere and lets
+    the skipif be deleted. macOS has since joined the XDG branch, which
+    narrows the gap but does not close it: Windows is still on the other.
 
     A "distinct subtree" harness (`EngineHarness(temp_home / "h1")`, the
     pattern this test and `decision_at()` in `TestAdaptiveScheduler` use)
@@ -276,8 +277,8 @@ class TestEngineHarnessIsolation:
     ):
         """The `Path.home()` patch is NOT a superset of the
         `$XDG_DATA_HOME` one. `get_backup_root()` gives `$XDG_DATA_HOME`
-        precedence over `Path.home()` on Linux/WSL
-        (paths.py:101-107) -- so a developer/CI with `XDG_DATA_HOME` exported
+        precedence over `Path.home()` everywhere but Windows
+        -- so a developer/CI with `XDG_DATA_HOME` exported
         still gets two harnesses colliding on ONE store, even though each
         harness's `Path.home()` differs. The prior test above cannot see this
         because the autouse `_isolate_real_home` fixture unconditionally

@@ -9,9 +9,9 @@ claude-code does. Key rules (from claude-code source):
   ``.claude.json`` sits at homedir by default, not inside ``.claude/``.
 - Credentials: ``<config_home>/.credentials.json``.
 
-Also resolves the cswap backup root, which on Linux/WSL follows the XDG Base
-Directory Specification (``$XDG_DATA_HOME/claude-swap``) and falls back to the
-legacy ``~/.claude-swap-backup`` on macOS/Windows.
+Also resolves the cswap backup root, which follows the XDG Base Directory
+Specification (``$XDG_DATA_HOME/claude-swap``) everywhere but Windows, where
+the legacy ``~/.claude-swap-backup`` layout stays.
 
 References:
 - claude-code utils/env.ts getGlobalClaudeFile
@@ -90,22 +90,30 @@ def get_legacy_backup_root() -> Path:
 def get_backup_root() -> Path:
     """Return the cswap backup root for the current platform.
 
-    Linux/WSL: ``$XDG_DATA_HOME/claude-swap`` (default ``~/.local/share/claude-swap``).
-    macOS/Windows/unknown: ``~/.claude-swap-backup`` (legacy layout).
+    Everywhere but Windows: ``$XDG_DATA_HOME/claude-swap`` (default
+    ``~/.local/share/claude-swap``). Windows: ``~/.claude-swap-backup``,
+    the legacy layout — ``~/.local/share`` is not a place there, and its
+    own convention (``%APPDATA%``) would be a second migration with no way
+    to test it.
+
+    macOS takes the XDG layout too, deliberately and against Apple's own
+    convention (``~/Library/Application Support``): one layout shared with
+    Linux costs one directory name, while a third one would cost a third
+    migration and a permanent platform fork in every path that reads it.
 
     Per the XDG spec, ``$XDG_DATA_HOME`` is ignored when unset, empty, or
     non-absolute. A leading ``~`` is expanded so values like ``~/data`` set
     via systemd unit files or Dockerfiles (which don't get shell expansion)
     still work.
     """
-    if Platform.detect() in (Platform.LINUX, Platform.WSL):
-        xdg = os.environ.get("XDG_DATA_HOME", "")
-        if xdg:
-            xdg_path = Path(os.path.expanduser(xdg))
-            if xdg_path.is_absolute():
-                return xdg_path / "claude-swap"
-        return Path.home() / ".local" / "share" / "claude-swap"
-    return get_legacy_backup_root()
+    if Platform.detect() is Platform.WINDOWS:
+        return get_legacy_backup_root()
+    xdg = os.environ.get("XDG_DATA_HOME", "")
+    if xdg:
+        xdg_path = Path(os.path.expanduser(xdg))
+        if xdg_path.is_absolute():
+            return xdg_path / "claude-swap"
+    return Path.home() / ".local" / "share" / "claude-swap"
 
 
 # Names that any prior cswap run may have created in the backup root without
@@ -155,6 +163,31 @@ def migration_flag_for(target: Path) -> Path:
     return target.parent / f".{target.name}.migrating"
 
 
+def leave_compat_symlink(legacy: Path, target: Path) -> bool:
+    """Point the vacated legacy path at ``target``. Best effort.
+
+    Deliberately outside the migration's success condition: by the time this
+    runs the data is already at ``target``, and a link that cannot be created
+    (Windows without developer mode, a read-only ``$HOME``) is a cosmetic
+    loss, not a failed migration.
+
+    It exists for addresses handed out before the move and still in use
+    afterwards: a ``CLAUDE_CONFIG_DIR`` exported into a live session shell,
+    a PyPI-installed copy of cswap sharing the same ``$HOME``. Without the
+    link the first would break and the second would quietly build a second
+    store next to the real one.
+
+    Returns True if the link is now in place.
+    """
+    try:
+        if legacy.is_symlink():
+            return True
+        legacy.symlink_to(target, target_is_directory=True)
+    except OSError:
+        return False
+    return True
+
+
 def migrate_legacy_backup_dir(target: Path) -> bool:
     """Move the legacy backup directory to ``target`` if needed.
 
@@ -172,6 +205,10 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
       prior cswap run may have laid down before legacy reappeared (e.g.
       first run on a fresh box, then legacy synced in from another machine).
       In that case wipe the artifacts and migrate normally.
+
+    A successful move leaves a symlink behind at the legacy path (see
+    :func:`leave_compat_symlink`), which is also what makes the next run a
+    no-op: ``legacy.resolve()`` then answers ``target``.
 
     Returns:
         True if the move ran in this call, False if it was a no-op.
@@ -218,4 +255,8 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
             f"Migration of {legacy} → {target} failed: {exc}"
         ) from exc
 
+    # After the flag is cleared, never before: a crash between the two would
+    # leave a link the `same_path` check at the top reads as "already
+    # migrated", and the flag would then never be unlinked.
+    leave_compat_symlink(legacy, target)
     return True

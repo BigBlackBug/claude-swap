@@ -4992,6 +4992,89 @@ class TestAddAccountSlot:
         assert data["sequence"] == [2, 5]
 
 
+class TestMacosStoreRelocation:
+    """macOS moved off ``~/.claude-swap-backup`` onto the XDG layout.
+
+    The move itself is `paths.migrate_legacy_backup_dir`, already covered in
+    `tests/test_paths.py`. What these cases pin is the part only the switcher
+    can get wrong: that init performs it at all on macOS (it was a no-op
+    there for as long as the two roots aliased), and that it says what the
+    move costs on that platform specifically.
+    """
+
+    def _macos(self, monkeypatch):
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.MACOS))
+
+    def test_init_moves_the_legacy_store_and_leaves_a_link(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ):
+        from claude_swap.paths import get_backup_root, get_legacy_backup_root
+
+        self._macos(monkeypatch)
+        legacy = get_legacy_backup_root()
+        (legacy / "configs").mkdir(parents=True)
+        (legacy / "sequence.json").write_text('{"sequence": [1]}')
+
+        switcher = ClaudeAccountSwitcher()
+
+        assert switcher.backup_dir == get_backup_root() != legacy
+        assert (switcher.backup_dir / "sequence.json").read_text() == '{"sequence": [1]}'
+        # The old address still answers, for a session shell that exported it.
+        assert legacy.is_symlink()
+        assert legacy.resolve() == switcher.backup_dir.resolve()
+        assert "migrated data from" in capsys.readouterr().err
+
+    def test_warns_that_session_profiles_were_stranded(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ):
+        """Their Keychain service name is the profile's old absolute path.
+
+        The directories travel with the store and the items do not, which is
+        a loss that shows up only when the next `cswap run` fails to log in
+        -- long after the line that could have explained it.
+        """
+        from claude_swap.paths import get_legacy_backup_root
+
+        self._macos(monkeypatch)
+        legacy = get_legacy_backup_root()
+        (legacy / "sessions" / "2-user_at_example.com").mkdir(parents=True)
+
+        ClaudeAccountSwitcher()
+
+        err = capsys.readouterr().err
+        assert "1 session profile(s)" in err
+        assert "Keychain" in err
+
+    def test_no_session_warning_when_there_are_no_profiles(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ):
+        from claude_swap.paths import get_legacy_backup_root
+
+        self._macos(monkeypatch)
+        (get_legacy_backup_root() / "configs").mkdir(parents=True)
+
+        ClaudeAccountSwitcher()
+
+        assert "session profile(s)" not in capsys.readouterr().err
+
+    def test_no_session_warning_off_macos(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ):
+        """Elsewhere the credential is a file inside the profile directory,
+        so it moves with it and there is nothing to report."""
+        from claude_swap.paths import get_legacy_backup_root
+
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+        legacy = get_legacy_backup_root()
+        (legacy / "sessions" / "2-user_at_example.com").mkdir(parents=True)
+
+        ClaudeAccountSwitcher()
+
+        err = capsys.readouterr().err
+        assert "migrated data from" in err
+        assert "session profile(s)" not in err
+
+
 class TestPurgeLegacyCleanup:
     """``purge`` must remove a stale legacy directory if it ever reappears.
 
@@ -5002,9 +5085,10 @@ class TestPurgeLegacyCleanup:
     """
 
     def _ensure_linux_layout(self, monkeypatch):
-        # Tests must observe the post-migration two-path world. On macOS in
-        # CI the backup root and the legacy root are the same directory, so
-        # there's nothing distinct to clean — pin to LINUX semantics.
+        # Tests must observe the post-migration two-path world. macOS now
+        # resolves the same way, but Windows still aliases the two roots and
+        # a CI job there would have nothing distinct to clean — pin the
+        # layout rather than inherit whatever the runner happens to be.
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
 
     def _make_switcher_then_recreate_legacy(
@@ -5054,6 +5138,32 @@ class TestPurgeLegacyCleanup:
         out = capsys.readouterr().out
         assert str(backup_dir) in out
         assert str(legacy) in out
+
+    def test_purge_removes_the_compatibility_symlink(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`exists()` follows links, and purge rmtree's the target first.
+
+        By the time the legacy path is considered the link is dangling, so a
+        check phrased as `exists()` walks past it and leaves a symlink
+        pointing at nothing in the user's $HOME -- after a command whose
+        whole promise is that nothing is left.
+        """
+        from claude_swap.paths import get_backup_root, get_legacy_backup_root
+
+        self._ensure_linux_layout(monkeypatch)
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        switcher = ClaudeAccountSwitcher()
+        legacy = get_legacy_backup_root()
+        legacy.symlink_to(backup_dir, target_is_directory=True)
+
+        with patch("builtins.input", return_value="y"):
+            switcher.purge()
+
+        assert not backup_dir.exists()
+        assert not legacy.is_symlink()
+        assert not legacy.exists()
 
     def test_purge_prompt_omits_legacy_when_absent(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys

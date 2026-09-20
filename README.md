@@ -235,12 +235,14 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | Platform | Credentials | Config backups |
 |----------|-------------|----------------|
 | Windows | File-based (inside the backup directory, under `credentials/`) | `~/.claude-swap-backup/` |
-| macOS | macOS Keychain | `~/.claude-swap-backup/` |
+| macOS | macOS Keychain | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
-On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
+Everywhere but Windows, set `XDG_DATA_HOME` to override the default location.
+
+**Moving off `~/.claude-swap-backup`.** macOS used to keep everything in `~/.claude-swap-backup/`, and the first run after upgrading moves it to the XDG path above, printing the old and new locations. The move is atomic and resumable, and it leaves a symlink behind at the old path so anything still holding that address keeps working. On macOS only, existing session-mode profiles do not survive it: their Keychain entries are keyed by the profile's absolute path, so delete `sessions/` and start fresh sessions with `cswap run` (the run itself prints this if any profiles were present).
 
 ## Menu bar (macOS)
 

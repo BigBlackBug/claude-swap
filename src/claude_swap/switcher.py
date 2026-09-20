@@ -312,17 +312,18 @@ class ClaudeAccountSwitcher:
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
 
-        # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
-        # before any logger or directory setup writes to the new location.
-        # Migration is a no-op on macOS/Windows where backup_dir already
-        # equals the legacy path. MigrationError on a genuine collision
-        # propagates as a ClaudeSwitchError and is caught by the CLI.
+        # Migrate legacy ~/.claude-swap-backup to the XDG path before any
+        # logger or directory setup writes to the new location. A no-op on
+        # Windows, where backup_dir still equals the legacy path, and on any
+        # box that has already migrated. MigrationError on a genuine
+        # collision propagates as a ClaudeSwitchError and is caught by the CLI.
         if migrate_legacy_backup_dir(self.backup_dir):
             legacy = get_legacy_backup_root()
             print(
                 f"claude-swap: migrated data from {legacy} to {self.backup_dir}",
                 file=sys.stderr,
             )
+            self._warn_relocated_session_profiles()
 
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
@@ -385,6 +386,38 @@ class ClaudeAccountSwitcher:
         from claude_swap.migrations import run_migrations
 
         run_migrations(self)
+
+    def _warn_relocated_session_profiles(self) -> None:
+        """Say out loud that the move stranded macOS session credentials.
+
+        A session profile's credential lives in a Keychain item whose service
+        name Claude Code derives from the ``CLAUDE_CONFIG_DIR`` string it was
+        launched with -- and that string is the profile's absolute path. The
+        migration renames every one of them at once, so the old items are
+        still in the Keychain and no longer addressable by any path cswap
+        can construct. Nothing irreplaceable is lost (a profile is re-seeded
+        from the account's own backup), but a stale seed file left inside a
+        profile can make the next `cswap run` believe the credential is there.
+
+        Elsewhere the credential is a plain file inside the profile directory
+        and travels with it, so there is nothing to warn about.
+        """
+        if self.platform != Platform.MACOS:
+            return
+        sessions = self.backup_dir / "sessions"
+        try:
+            stranded = [d.name for d in sessions.iterdir() if d.is_dir()]
+        except OSError:
+            return
+        if not stranded:
+            return
+        print(
+            f"claude-swap: {len(stranded)} session profile(s) moved with the "
+            f"store; their macOS Keychain entries are keyed by the old path "
+            f"and no longer resolve. Remove {sessions} and start fresh "
+            f"sessions with `cswap run`.",
+            file=sys.stderr,
+        )
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -7395,9 +7428,9 @@ class ClaudeAccountSwitcher:
           macOS both the Keychain items via ``security`` and any fallback ``.enc``
           files), plus a best-effort sweep of any pre-migration keyring / Windows
           Credential Manager entries left behind
-        - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
-        - Any stale legacy ~/.claude-swap-backup directory left around from
-          before the XDG migration
+        - The active backup directory (XDG path everywhere but Windows, which keeps ~/.claude-swap-backup)
+        - Whatever is left at ~/.claude-swap-backup: the compatibility symlink
+          the XDG migration leaves there, or a stale directory from before it
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
@@ -7443,8 +7476,9 @@ class ClaudeAccountSwitcher:
 
         warning("This will remove ALL claude-swap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
-        if legacy_distinct and legacy.exists():
-            print(f"  - Legacy backup directory: {legacy}")
+        if legacy_distinct and (legacy.is_symlink() or legacy.exists()):
+            kind = "symlink" if legacy.is_symlink() else "directory"
+            print(f"  - Legacy backup {kind}: {legacy}")
         if self.platform == Platform.MACOS:
             print("  - All stored account credentials (macOS Keychain and/or files)")
         else:
@@ -7521,12 +7555,19 @@ class ClaudeAccountSwitcher:
             shutil.rmtree(self.backup_dir)
             removed_items.append(f"Directory: {self.backup_dir}")
 
-        # Also clean a stale legacy directory if it somehow still exists
-        # (e.g. a partial pre-migration state, or files re-created after init).
-        if legacy_distinct and legacy.exists():
+        # Also clean the vacated legacy path: the compatibility symlink the
+        # migration leaves there, or a stale directory (a partial
+        # pre-migration state, or files re-created after init). `exists()`
+        # follows symlinks, so once the rmtree above has taken the backup
+        # dir the link is dangling and only `is_symlink()` still sees it.
+        if legacy_distinct and (legacy.is_symlink() or legacy.exists()):
             try:
-                shutil.rmtree(legacy)
-                removed_items.append(f"Legacy directory: {legacy}")
+                if legacy.is_symlink():
+                    legacy.unlink()
+                    removed_items.append(f"Legacy symlink: {legacy}")
+                else:
+                    shutil.rmtree(legacy)
+                    removed_items.append(f"Legacy directory: {legacy}")
             except OSError:
                 pass
 

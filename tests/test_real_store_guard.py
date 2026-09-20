@@ -312,7 +312,7 @@ def test_frozen_specs_include_the_two_non_recursive_roots(
     assert home in non_recursive_roots
 
 
-@pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+@pytest.mark.parametrize("platform", [Platform.LINUX, Platform.WINDOWS])
 def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     monkeypatch, tmp_path, platform
 ):
@@ -325,11 +325,11 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
 
     Parametrized over the two store layouts, because they put the flag in
     different places: XDG at ``~/.local/share/.claude-swap.migrating``,
-    whose parent is no root at all, and legacy (macOS, and Windows through
-    the same branch) at ``~/..claude-swap-backup.migrating``, a direct child
-    of the ``$HOME`` root. Only the XDG layout leaves it uncovered without
-    this entry, so a premise phrased for that one alone is false on the
-    other two platforms.
+    whose parent is no root at all, and legacy (Windows, the only platform
+    still on that branch) at ``~/..claude-swap-backup.migrating``, a direct
+    child of the ``$HOME`` root. Only the XDG layout leaves it uncovered
+    without this entry, so a premise phrased for that one alone is false on
+    the other.
     """
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
@@ -342,7 +342,7 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     # arms resolve the same store, and the legacy coverage this test exists
     # for disappears with nothing failing.
     assert paths.get_backup_root() == (
-        home / ".claude-swap-backup" if platform is Platform.MACOS
+        home / ".claude-swap-backup" if platform is Platform.WINDOWS
         else home / ".local" / "share" / "claude-swap"
     )
 
@@ -803,10 +803,10 @@ def test_the_legacy_backup_root_is_protected_recursively():
     original incident overwrote was nested (`credentials/*.enc`). Asserting
     membership alone passes on a spec downgraded to non-recursive.
 
-    On macOS and Windows `get_backup_root()` returns this same path, so the
-    entry is a duplicate there and dropping it is a no-op. The assert is
-    Linux-only in effect and needs no marker: if those platforms ever stop
-    aliasing the two, it starts firing there too.
+    On Windows `get_backup_root()` returns this same path, so the entry is a
+    duplicate there and dropping it is a no-op. Everywhere else — macOS
+    included since the XDG move — the two are separate paths and this assert
+    is what arms the legacy one.
     """
     # THE ARTIFACT THE HOOK READS, not the factory that built it. The hook
     # branches on the module global frozen at import; asserting on a fresh
@@ -861,13 +861,14 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     pwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    # POINTED AWAY -- ON LINUX AND WSL ONLY. There the ambient pass then
+    # POINTED AWAY -- NOT ON WINDOWS. Everywhere else the ambient pass then
     # cannot supply the scratch root, so the assert below rests on the pass
-    # this case names, and dropping `default_specs` fails it. On macOS and
-    # Windows `get_backup_root()` ignores `XDG_DATA_HOME` entirely and
-    # answers `~/.claude-swap-backup`, so both passes resolve to the same
-    # directory and this case cannot tell them apart -- the mutation it
-    # claims to kill SURVIVES on those jobs. Measured on both.
+    # this case names, and dropping `default_specs` fails it. On Windows
+    # `get_backup_root()` ignores `XDG_DATA_HOME` entirely and answers
+    # `~/.claude-swap-backup`, so both passes resolve to the same directory
+    # and this case cannot tell them apart -- the mutation it claims to kill
+    # SURVIVES on that job. (This case is skipped on Windows anyway; the note
+    # stands for whoever reads the two passes side by side.)
     #
     # The pass is still load-bearing in the scenario this case exists for:
     # the mandated recipe exports HOME AND `XDG_DATA_HOME` before the
@@ -878,10 +879,9 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
     roots = [root for root, _recursive in specs]
 
     # THE LAYOUT IS PER-PLATFORM, so both expectations are DERIVED under the
-    # HOME each snapshot resolves against, never spelled out. Written as the
-    # XDG path they named a directory macOS does not use: the backup root
-    # there is `~/.claude-swap-backup`, so this case failed on the one
-    # platform whose store lives somewhere else.
+    # HOME each snapshot resolves against, never spelled out. Spelling out
+    # one layout is what broke this case before: written as the XDG path it
+    # named a directory the legacy platform does not use, and vice versa.
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(pwd_home))
     # THE PREMISE FOR THE THING THAT CAN SILENTLY BREAK. `_REAL_PATH_HOME` is

@@ -93,7 +93,7 @@ class TestGetCredentialsPath:
 
 
 class TestGetBackupRoot:
-    """Linux/WSL: XDG-aware path. Other platforms: legacy ~/.claude-swap-backup."""
+    """XDG-aware path everywhere but Windows, which keeps the legacy root."""
 
     def test_linux_default_is_xdg_data_home(
         self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -141,15 +141,48 @@ class TestGetBackupRoot:
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.WSL))
         assert get_backup_root() == isolated_home / ".local" / "share" / "claude-swap"
 
-    def test_macos_uses_legacy_layout(
+    def test_macos_uses_the_xdg_layout_too(
         self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
     ):
+        """Against Apple's own convention, and on purpose: see get_backup_root."""
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.MACOS))
-        assert get_backup_root() == isolated_home / LEGACY_BACKUP_DIRNAME
+        assert get_backup_root() == isolated_home / ".local" / "share" / "claude-swap"
+
+    def test_macos_respects_xdg_data_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """One layout means one set of rules, the override included.
+
+        A macOS branch that landed in ~/.local/share but ignored the variable
+        naming it would be the XDG layout in spelling only.
+        """
+        custom = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_DATA_HOME", str(custom))
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.MACOS))
+        assert get_backup_root() == custom / "claude-swap"
+
+    def test_unknown_platform_uses_the_xdg_layout(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Only Windows is named as the exception, so everything else follows
+        the rule — a BSD is far closer to the XDG world than to %APPDATA%."""
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.UNKNOWN))
+        assert get_backup_root() == isolated_home / ".local" / "share" / "claude-swap"
 
     def test_windows_uses_legacy_layout(
         self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
     ):
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.WINDOWS))
+        assert get_backup_root() == isolated_home / LEGACY_BACKUP_DIRNAME
+
+    def test_windows_ignores_xdg_data_home(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The variable must not drag the one remaining legacy platform off
+        its layout — there is no migration written for that direction."""
+        monkeypatch.setenv("XDG_DATA_HOME", str(isolated_home / "xdg"))
         monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.WINDOWS))
         assert get_backup_root() == isolated_home / LEGACY_BACKUP_DIRNAME
 
@@ -159,6 +192,21 @@ class TestGetBackupRoot:
         assert get_legacy_backup_root() == isolated_home / LEGACY_BACKUP_DIRNAME
 
 
+def _assert_legacy_vacated(legacy: Path, target: Path) -> None:
+    """The legacy directory is gone, and points at ``target`` where it can.
+
+    The compatibility link is best effort by design (see
+    ``paths.leave_compat_symlink``): Windows refuses directory symlinks to an
+    unprivileged process, and the migration does not fail over a cosmetic
+    loss. What must hold on every platform is that the directory itself no
+    longer exists — the link, where it exists, is asserted on its own below.
+    """
+    if legacy.is_symlink():
+        assert legacy.resolve() == target.resolve()
+    else:
+        assert not legacy.exists()
+
+
 class TestMigrateLegacyBackupDir:
     def test_no_legacy_is_noop(self, isolated_home: Path):
         target = isolated_home / ".local" / "share" / "claude-swap"
@@ -166,7 +214,7 @@ class TestMigrateLegacyBackupDir:
         assert not target.exists()
 
     def test_target_equals_legacy_is_noop(self, isolated_home: Path):
-        # macOS/Windows: backup_root == legacy. Migration must not touch it.
+        # Windows: backup_root == legacy. Migration must not touch it.
         legacy = isolated_home / LEGACY_BACKUP_DIRNAME
         legacy.mkdir()
         (legacy / "marker").write_text("keep me")
@@ -183,7 +231,7 @@ class TestMigrateLegacyBackupDir:
 
         target = isolated_home / ".local" / "share" / "claude-swap"
         assert migrate_legacy_backup_dir(target) is True
-        assert not legacy.exists()
+        _assert_legacy_vacated(legacy, target)
         assert (target / "sequence.json").read_text() == '{"k": 1}'
         assert (target / "configs" / "x.json").read_text() == "{}"
 
@@ -221,7 +269,7 @@ class TestMigrateLegacyBackupDir:
         (target / "claude-swap.log.1").write_text("rotated")
 
         assert migrate_legacy_backup_dir(target) is True
-        assert not legacy.exists()
+        _assert_legacy_vacated(legacy, target)
         assert (target / "sequence.json").read_text() == '{"src": "legacy"}'
         # Throwaway artifacts were replaced by legacy contents.
         assert not (target / "cache").exists()
@@ -261,7 +309,7 @@ class TestMigrateLegacyBackupDir:
         flag.touch()
 
         assert migrate_legacy_backup_dir(target) is True
-        assert not legacy.exists()
+        _assert_legacy_vacated(legacy, target)
         assert not flag.exists()
         assert not (target / "stale-partial.json").exists()
         assert (target / "sequence.json").read_text() == '{"src": "legacy"}'
@@ -298,6 +346,74 @@ class TestMigrateLegacyBackupDir:
             migrate_legacy_backup_dir(target)
         # Legacy untouched (the real shutil.move was never called).
         assert (legacy / "sequence.json").read_text() == "{}"
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="Windows refuses directory symlinks unprivileged"
+    )
+    def test_leaves_a_compat_symlink_at_the_vacated_path(self, isolated_home: Path):
+        """The old address keeps working after the move.
+
+        A live session shell carries the old path in ``CLAUDE_CONFIG_DIR``,
+        and a PyPI-installed copy of cswap sharing this $HOME still resolves
+        the legacy root — without the link the first breaks and the second
+        silently starts a second store.
+        """
+        legacy = isolated_home / LEGACY_BACKUP_DIRNAME
+        legacy.mkdir()
+        (legacy / "sequence.json").write_text('{"src": "legacy"}')
+
+        target = isolated_home / ".local" / "share" / "claude-swap"
+        assert migrate_legacy_backup_dir(target) is True
+
+        assert legacy.is_symlink()
+        assert legacy.resolve() == target.resolve()
+        # Readable THROUGH the link, not merely present as one.
+        assert (legacy / "sequence.json").read_text() == '{"src": "legacy"}'
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="Windows refuses directory symlinks unprivileged"
+    )
+    def test_second_run_is_a_noop_through_the_symlink(self, isolated_home: Path):
+        """Idempotence rests on the link, so it has to be tested through it.
+
+        Once the link is in place ``legacy.resolve()`` answers the target,
+        which is exactly what the ``same_path`` guard reads — and a second
+        migration that did anything at all would be moving the store into
+        itself.
+        """
+        legacy = isolated_home / LEGACY_BACKUP_DIRNAME
+        legacy.mkdir()
+        (legacy / "sequence.json").write_text('{"src": "legacy"}')
+        target = isolated_home / ".local" / "share" / "claude-swap"
+        assert migrate_legacy_backup_dir(target) is True
+
+        assert migrate_legacy_backup_dir(target) is False
+        assert (target / "sequence.json").read_text() == '{"src": "legacy"}'
+        assert legacy.is_symlink()
+        assert not (target.parent / f".{target.name}.migrating").exists()
+
+    def test_unlinkable_legacy_path_does_not_fail_the_migration(
+        self, isolated_home: Path, monkeypatch
+    ):
+        """The data is already home by the time the link is attempted.
+
+        Windows without developer mode and a read-only $HOME both land here;
+        neither is a reason to report a failed migration over a store that
+        moved cleanly.
+        """
+        legacy = isolated_home / LEGACY_BACKUP_DIRNAME
+        legacy.mkdir()
+        (legacy / "sequence.json").write_text('{"src": "legacy"}')
+        target = isolated_home / ".local" / "share" / "claude-swap"
+
+        def refuse(*args, **kwargs):
+            raise OSError("symlink privilege not held")
+
+        monkeypatch.setattr(Path, "symlink_to", refuse)
+
+        assert migrate_legacy_backup_dir(target) is True
+        assert (target / "sequence.json").read_text() == '{"src": "legacy"}'
+        assert not legacy.exists()
 
     def test_preserves_file_modes(self, isolated_home: Path):
         if os.name == "nt":

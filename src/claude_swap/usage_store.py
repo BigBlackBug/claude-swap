@@ -267,6 +267,12 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # Slot the live credential was proven to belong to, when the foreign
+    # sentinel could attribute it to another MANAGED account. Rides on the
+    # sentinel and is never persisted (the attribution is re-derived from the
+    # oracle every pass, exactly like the sentinel itself); it exists so every
+    # surface can name the account instead of saying "another account".
+    foreign_owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +316,11 @@ class UsageEntry:
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
     claim_until: float | None = None
+    # Companion overlay to ``sentinel`` (never persisted): the managed slot
+    # the live credential was proven to belong to under
+    # USAGE_FOREIGN_CREDENTIAL. None when the sentinel is something else, or
+    # when the foreign identity matched no managed slot.
+    foreign_owner: str | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -1227,8 +1238,16 @@ def _row_eligible(
     return poll_due or stale
 
 
-def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:
-    """Overlay a derived sentinel state on a stored entry (read model only)."""
+def with_sentinel(
+    entry: UsageEntry, sentinel: str | None, foreign_owner: str | None = None
+) -> UsageEntry:
+    """Overlay a derived sentinel state on a stored entry (read model only).
+
+    ``foreign_owner`` rides on the sentinel and is dropped without it: an
+    owner attribution describes the live credential *under* the foreign
+    sentinel, so carrying one on an entry that has no sentinel would let a
+    surface render a state the collector did not conclude.
+    """
     if sentinel is None:
         return entry
-    return replace(entry, sentinel=sentinel)
+    return replace(entry, sentinel=sentinel, foreign_owner=foreign_owner)

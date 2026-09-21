@@ -312,6 +312,26 @@ class TestFormatting:
             assert tui_data.sentinel_label(sentinel) == note
         assert tui_data.sentinel_label("unknown state") == "unknown state"
 
+    def test_foreign_sentinel_names_the_owner_like_cswap_list(self):
+        # The foreign note is the one sentinel refined by what the collector
+        # learned, so the parity above is not enough on its own: the TUI must
+        # name the owning slot in the same words, and fall back to the generic
+        # table wording when the credential was attributed to nobody.
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+        from claude_swap.switcher import SENTINEL_NOTES, sentinel_note
+
+        assert tui_data.sentinel_label(USAGE_FOREIGN_CREDENTIAL, "2") == (
+            "live credential belongs to Account-2 — a switch repairs it"
+        )
+        assert (
+            tui_data.sentinel_label(USAGE_FOREIGN_CREDENTIAL, "2")
+            == sentinel_note(USAGE_FOREIGN_CREDENTIAL, "2")
+        )
+        assert (
+            tui_data.sentinel_label(USAGE_FOREIGN_CREDENTIAL, None)
+            == SENTINEL_NOTES[USAGE_FOREIGN_CREDENTIAL]
+        )
+
     def test_sentinel_card_shows_last_seen_like_cswap_list(self):
         # A sentinel is a live overlay — the entry can still carry the last
         # good measurement, and `cswap list` prints it as a "last seen" line.

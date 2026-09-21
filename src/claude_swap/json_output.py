@@ -243,6 +243,7 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    live_credential_owner: str | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -268,6 +269,13 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive field: under ``usageStatus == "foreign credential"``, the slot
+    # the live credential was proven to belong to. Present only when the
+    # oracle attributed it to another MANAGED account uuid-positively, so a
+    # script may act on it (the human note names the same slot); absent for an
+    # unmanaged or unattributable foreign login.
+    if live_credential_owner:
+        row["liveCredentialOwner"] = live_credential_owner
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

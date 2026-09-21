@@ -356,7 +356,9 @@ class AutoScreen(Screen):
             pct = binding_pct(acc.usage.last_good, models)
             if acc.usage.sentinel is not None:
                 entry.append(
-                    f"  {data.sentinel_label(acc.usage.sentinel)}",
+                    "  " + data.sentinel_label(
+                        acc.usage.sentinel, acc.usage.foreign_owner
+                    ),
                     style=palette.muted,
                 )
             elif pct is None:
@@ -402,7 +404,10 @@ class AutoScreen(Screen):
             entry.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
-                    f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
+                    "  " + data.sentinel_label(
+                        acc.usage.sentinel, acc.usage.foreign_owner
+                    ),
+                    style=palette.muted,
                 )
                 ranked.append((998.0, acc.number))
             elif pct is None:

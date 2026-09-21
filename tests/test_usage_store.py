@@ -1123,6 +1123,19 @@ class TestSentinels:
         assert entry.decision_value() == "token expired"
         assert entry.last_good == USAGE  # display can still show last-seen
 
+    def test_with_sentinel_carries_the_foreign_owner(self):
+        """The owner attribution is an overlay ON the sentinel: it travels
+        with one and is dropped without one, so no surface can render an
+        attribution the collector did not conclude."""
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+
+        entry = UsageEntry()
+        assert with_sentinel(
+            entry, USAGE_FOREIGN_CREDENTIAL, "2"
+        ).foreign_owner == "2"
+        assert with_sentinel(entry, USAGE_FOREIGN_CREDENTIAL).foreign_owner is None
+        assert with_sentinel(entry, None, "2") is entry
+
     def test_with_sentinel_none_is_identity(self):
         entry = UsageEntry(last_good=USAGE)
         assert with_sentinel(entry, None) is entry

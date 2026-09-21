@@ -23,7 +23,7 @@ from typing import Callable
 from claude_swap import oauth, printer, usage_store
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.snapshot_source import SnapshotSource
-from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
+from claude_swap.switcher import last_seen_note, sentinel_note
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +87,14 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
 # Display helpers
 # ---------------------------------------------------------------------------
 
-def sentinel_label(sentinel: str) -> str:
-    """The same wording ``cswap list`` prints for this sentinel state."""
-    return SENTINEL_NOTES.get(sentinel, sentinel)
+def sentinel_label(sentinel: str, foreign_owner: str | None = None) -> str:
+    """The same wording ``cswap list`` prints for this sentinel state.
+
+    ``foreign_owner`` is the entry's own attribution overlay (see
+    ``UsageEntry.foreign_owner``); passing it keeps the TUI's note identical
+    to the CLI's, which names the owning slot when the oracle found one.
+    """
+    return sentinel_note(sentinel, foreign_owner)
 
 
 def window_pct(last_good: dict | None, key: str) -> float | None:

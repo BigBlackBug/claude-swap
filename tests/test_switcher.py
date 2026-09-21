@@ -2730,7 +2730,11 @@ class TestActiveAccountRefresh:
 
         assert first.sentinel == USAGE_FOREIGN_CREDENTIAL
         assert first.usage is None
+        # Unmanaged identity: nothing to name and nothing to route it to, so
+        # the note stays the generic one (see the managed-owner test below).
+        assert first.foreign_owner is None
         assert second.sentinel == USAGE_FOREIGN_CREDENTIAL
+        assert second.foreign_owner is None
         write_backup.assert_not_called()
         write_backup2.assert_not_called()
         mock_probe.assert_called_once()
@@ -2740,6 +2744,112 @@ class TestActiveAccountRefresh:
             if "resolves to a different account" in r.getMessage()
         ]
         assert len(warnings) == 1
+
+    # Slot 2 of ``sample_sequence_data``, as the profile oracle resolves it:
+    # a MANAGED account, so a live credential wearing this identity under
+    # slot 1's config is drift between two slots cswap owns.
+    _PROFILE_SLOT_2 = {
+        "uuid": "uuid-2", "email": "account2@example.com",
+        "organizationUuid": None,
+    }
+
+    def test_fresh_foreign_managed_owner_is_adopted_and_named(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        caplog,
+    ):
+        """The field shape this fix exists for: ``~/.claude.json`` names slot
+        1 while the live credential is slot 2's (a Claude Code session that
+        outlived a switch rewrote the config). The oracle condemns the
+        credential for slot 1 — but it belongs to a slot cswap MANAGES, and
+        leaving it there is what kills slot 2: its own backup is the
+        predecessor Claude Code's rotation consumed, so the next poll POSTs a
+        spent grant and a single invalid_grant (AUTH_DEAD_STRIKES = 1)
+        quarantines a healthy account as "re-login needed".
+
+        So the bytes are routed into slot 2's backup here, exactly as a
+        switch would, and the sentinel carries the owner so every surface can
+        name it instead of saying "another account"."""
+        import logging
+
+        switcher = self._switcher(sample_sequence_data)
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            result, write_backup, mock_probe = self._fresh_drift_pass(
+                switcher, self._PROFILE_SLOT_2
+            )
+
+        assert result.sentinel == USAGE_FOREIGN_CREDENTIAL
+        assert result.usage is None          # never keyed to slot 1
+        assert result.foreign_owner == "2"
+        # Into the OWNER's backup — never slot 1's, whose only refresh token
+        # the write would destroy.
+        write_backup.assert_called_once_with(
+            "2", "account2@example.com", self._REFRESHED
+        )
+        mock_probe.assert_called_once()
+        drift = [
+            r for r in caplog.records
+            if "Config/credential drift" in r.getMessage()
+        ]
+        assert len(drift) == 1
+        assert "Account-2" in drift[0].getMessage()
+        assert "Account-1" in drift[0].getMessage()
+
+    def test_foreign_owner_routing_retries_but_warns_once(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        caplog,
+    ):
+        """A persistent drift is ONE log line, not one per collect pass — but
+        the routing is retried every pass regardless. The two must not share a
+        latch: the attempt that minted the verdict can lose the lock race, and
+        a warning already emitted must not be what stops the heal. (The
+        adoption itself is idempotent — once the owner's backup holds these
+        bytes, ``_foreign_generation_ahead`` answers False and nothing is
+        written; here the mocked backup never advances, so both passes
+        write.)"""
+        import logging
+
+        switcher = self._switcher(sample_sequence_data)
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            first, write1, probe1 = self._fresh_drift_pass(
+                switcher, self._PROFILE_SLOT_2
+            )
+            second, write2, probe2 = self._fresh_drift_pass(
+                switcher, self._PROFILE_SLOT_2
+            )
+
+        assert first.foreign_owner == second.foreign_owner == "2"
+        probe1.assert_called_once()
+        probe2.assert_not_called()           # verdict memoized, no re-probe
+        write1.assert_called_once_with(
+            "2", "account2@example.com", self._REFRESHED
+        )
+        write2.assert_called_once_with(
+            "2", "account2@example.com", self._REFRESHED
+        )
+        assert len([
+            r for r in caplog.records
+            if "Config/credential drift" in r.getMessage()
+        ]) == 1
+
+    def test_foreign_owner_needs_a_uuid_positive_attribution(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """An (email, org) match against a slot carrying no uuid is not
+        evidence enough to write into that slot's backup — the same bar the
+        switch path sets before it names a slot. Emails get recycled; uuids
+        do not."""
+        sample_sequence_data["accounts"]["2"].pop("uuid")
+        switcher = self._switcher(sample_sequence_data)
+
+        result, write_backup, _ = self._fresh_drift_pass(
+            switcher, self._PROFILE_SLOT_2
+        )
+
+        assert result.sentinel == USAGE_FOREIGN_CREDENTIAL
+        assert result.foreign_owner is None
+        write_backup.assert_not_called()
 
     def test_fresh_probe_failure_skips_resync_and_retries_next_pass(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -4256,6 +4366,88 @@ class TestDeadTokenQuarantine:
         run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
+    def test_a_healed_owner_slot_loses_its_quarantine_in_the_same_pass(
+        self, temp_home, sample_sequence_data
+    ):
+        """End to end, the incident this whole path exists for.
+
+        ``~/.claude.json`` names slot 1 while the live credential is slot 2's
+        newer generation (a Claude Code session that outlived a switch rewrote
+        the config, then rotated the token it still held). Slot 2's own backup
+        is therefore the consumed predecessor, and one invalid_grant has
+        already quarantined it as "re-login needed" — over an account whose
+        live successor cswap is holding.
+
+        One collect pass must undo all of it: slot 1 reports the foreign
+        credential and NAMES slot 2, slot 2's backup is resynced from the live
+        store, and slot 2's quarantine is lifted in this pass rather than the
+        next — the dead-token scan ran before the fetch that healed it, and a
+        false "re-login needed" left standing is exactly what sends a user to
+        re-login a healthy account."""
+        from claude_swap.json_output import (
+            USAGE_FOREIGN_CREDENTIAL,
+            USAGE_RELOGIN_REQUIRED,
+        )
+        from claude_swap.usage_store import FetchRecord
+
+        spent = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 1,
+        }})
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-new", "refreshToken": "rt-new",
+            "expiresAt": 9999999999000,
+        }})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        # Slot 1's own backup is a third lineage, so the served credential
+        # counts as drifted and the oracle is consulted at all.
+        switcher._write_account_credentials("1", "test@example.com", json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "at-1", "refreshToken": "rt-1", "expiresAt": 1,
+            }
+        }))
+        switcher._write_account_credentials("2", "account2@example.com", spent)
+
+        ident2 = ("account2@example.com", "")
+        switcher._usage_store.record(
+            {"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(spent),
+            )},
+            {"2": ident2},
+        )
+        info = [
+            (1, "test@example.com", "Org", "", True, live, ""),
+            (2, "account2@example.com", "Org", "", False, spent, ""),
+        ]
+
+        with patch.object(switcher, "_read_credentials", return_value=live), \
+             patch("claude_swap.oauth.fetch_oauth_profile", return_value={
+                 "uuid": "uuid-2", "email": "account2@example.com",
+                 "organizationUuid": None,
+             }), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})):
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
+        assert entries["1"].foreign_owner == "2"
+        # The successor reached the account that owns it...
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == live
+        # ...and the quarantine it never deserved is gone THIS pass.
+        assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED
+        assert entries["2"].sentinel is None
+        # The strike row is cleared too, or the next pass would skip the slot
+        # as quarantined and the display would flip back.
+        assert switcher._usage_store.entries(
+            {"2": ident2}
+        )["2"].auth_dead_strikes == 0
+
     def test_the_collector_hands_the_trust_bound_its_configured_models(
         self, temp_home
     ):
@@ -4528,6 +4720,132 @@ class TestResolveIdentifierAmbiguity:
 
 
 # ── Task 7: list_accounts org display ────────────────────────────────────────
+
+class TestForeignCredentialNote:
+    """The one sentinel whose wording depends on what the collector learned.
+
+    ``SENTINEL_NOTES`` is a flat table; ``sentinel_note`` is the single place
+    allowed to refine an entry of it, so that every surface (`cswap list`, the
+    TUI, the menubar) keeps describing a state in identical words."""
+
+    def _entry(self, owner):
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+        from claude_swap.usage_store import UsageEntry, with_sentinel
+
+        return with_sentinel(UsageEntry(), USAGE_FOREIGN_CREDENTIAL, owner)
+
+    def test_named_owner_replaces_another_account(self):
+        """"another account" is unactionable — the user cannot tell which one
+        to switch to. With an attribution, say it."""
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+        from claude_swap.switcher import sentinel_note
+
+        assert sentinel_note(USAGE_FOREIGN_CREDENTIAL, "2") == (
+            "live credential belongs to Account-2 — a switch repairs it"
+        )
+
+    def test_unattributed_foreign_keeps_the_table_wording(self):
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+        from claude_swap.switcher import SENTINEL_NOTES, sentinel_note
+
+        assert (
+            sentinel_note(USAGE_FOREIGN_CREDENTIAL, None)
+            == SENTINEL_NOTES[USAGE_FOREIGN_CREDENTIAL]
+        )
+        assert "another account" in sentinel_note(USAGE_FOREIGN_CREDENTIAL)
+
+    def test_owner_never_leaks_into_another_sentinel(self):
+        """An owner rides on the FOREIGN sentinel only. A slot sentineled for
+        some other reason must read exactly as the table says, whatever
+        attribution an earlier pass left lying around."""
+        from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+        from claude_swap.switcher import SENTINEL_NOTES, sentinel_note
+
+        assert (
+            sentinel_note(USAGE_TOKEN_EXPIRED, "2")
+            == SENTINEL_NOTES[USAGE_TOKEN_EXPIRED]
+        )
+
+    def test_unknown_sentinel_still_falls_back_to_its_raw_string(self):
+        from claude_swap.switcher import sentinel_note
+
+        assert sentinel_note("brand new state", "2") == "brand new state"
+
+    def test_cswap_list_renders_the_named_note(self):
+        """The CLI line itself, not just the helper: `cswap list` prints the
+        refined note for the row."""
+        from claude_swap.switcher import _usage_entry_lines
+
+        lines = _usage_entry_lines(self._entry("2"))
+        assert "Account-2" in lines[0]
+
+
+class TestCredentialDriftWarning:
+    """`cswap list` says out loud that ``(active)`` is on the wrong row.
+
+    The per-row note can only talk about the row it sits under; the thing
+    that actually misleads here is that Claude Code is running as the account
+    one row DOWN, which looks perfectly ordinary."""
+
+    def _entries(self, owner):
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+        from claude_swap.usage_store import UsageEntry, with_sentinel
+
+        return {
+            "1": with_sentinel(UsageEntry(), USAGE_FOREIGN_CREDENTIAL, owner),
+            "2": UsageEntry(),
+        }
+
+    def _info(self, owner_alias="work"):
+        return [
+            (1, "pers@example.com", "Org", "", True, "{}", "pers"),
+            (2, "work@example.com", "Org", "", False, "{}", owner_alias),
+        ]
+
+    def test_names_both_slots_and_offers_the_switch(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        [msg] = switcher._credential_drift_warnings(
+            self._info(), self._entries("2")
+        )
+        assert "Account-1 is marked active" in msg
+        assert "Account-2 (work@example.com)" in msg
+        assert msg.endswith("cswap switch work")
+
+    def test_falls_back_to_the_slot_number_without_an_alias(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        [msg] = switcher._credential_drift_warnings(
+            self._info(owner_alias=""), self._entries("2")
+        )
+        assert msg.endswith("cswap switch 2")
+
+    def test_silent_when_the_foreign_login_is_unattributed(self, temp_home):
+        """An unmanaged foreign login names no slot and offers no switch —
+        the row's own note is all there is to say."""
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._credential_drift_warnings(
+            self._info(), self._entries(None)
+        ) == []
+
+    def test_silent_without_the_foreign_sentinel(self, temp_home):
+        from claude_swap.usage_store import UsageEntry
+
+        switcher = ClaudeAccountSwitcher()
+        assert switcher._credential_drift_warnings(
+            self._info(), {"1": UsageEntry(), "2": UsageEntry()}
+        ) == []
+
+    def test_reaches_the_json_payload(self, temp_home):
+        """Scripts get it too, as an additive key absent when clean — the
+        same contract as the other cross-account warnings."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        payload = switcher._build_list_payload(self._info(), self._entries("2"))
+        assert payload["credentialDriftWarnings"] == [
+            switcher._credential_drift_warnings(self._info(), self._entries("2"))[0]
+        ]
+        clean = switcher._build_list_payload(self._info(), self._entries(None))
+        assert "credentialDriftWarnings" not in clean
+
 
 class TestListAccountsOrgDisplay:
     def test_shows_org_name_and_personal(self, temp_home, mock_credentials_file,

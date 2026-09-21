@@ -205,6 +205,26 @@ SENTINEL_NOTES = {
 }
 
 
+def sentinel_note(sentinel: str, foreign_owner: str | None = None) -> str:
+    """The human wording for a sentinel state — what EVERY surface prints.
+
+    ``SENTINEL_NOTES`` stays the plain table; this is the one place that may
+    refine a note with what the collector learned about the state. Today that
+    is the foreign credential's owner: when the oracle attributed the live
+    credential to another MANAGED slot, naming it turns an unactionable
+    "another account" into the account the user has to switch to. An
+    unattributable foreign credential (unmanaged login, partial profile) keeps
+    the table's generic wording, and an unknown sentinel still falls back to
+    its own raw string.
+    """
+    if sentinel == USAGE_FOREIGN_CREDENTIAL and foreign_owner:
+        return (
+            f"live credential belongs to Account-{foreign_owner} — "
+            "a switch repairs it"
+        )
+    return SENTINEL_NOTES.get(sentinel, sentinel)
+
+
 def last_seen_note(entry: UsageEntry) -> str | None:
     """"last seen 53% used · 12m ago" from an entry's last-good measurement.
 
@@ -232,7 +252,7 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     error, so a failing endpoint is visible instead of a silent blank.
     """
     if entry.sentinel is not None:
-        out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
+        out = [dimmed(sentinel_note(entry.sentinel, entry.foreign_owner))]
         last_seen = last_seen_note(entry)
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
@@ -360,6 +380,34 @@ class ClaudeAccountSwitcher:
         # account in a long-lived process warns afresh and distinct
         # conditions don't suppress each other's warning.
         self._provenance_warned: set[tuple[str, str, str]] = set()
+
+        # Config/credential drift already reported, keyed by (slot, email) and
+        # valued by the owning slot the live credential resolved to ("" when
+        # it matched no managed account). Keyed by the STATE rather than by a
+        # plain reason flag so the warning repeats when the drift changes
+        # shape (a different owner, or an owner appearing where none
+        # resolved), while a persistent drift stays a single line instead of
+        # one per collect pass. Cleared when the slot's own lineage resolves
+        # again.
+        self._drift_warned: dict[tuple[str, str], str] = {}
+
+        # Owning slot for lineages the oracle condemned as foreign, keyed by
+        # _lineage_key exactly like ``_probe_verdicts`` — a False verdict
+        # there means "not this slot's", and this says whose it IS when the
+        # resolved identity named a managed account uuid-positively. Entries
+        # only ever accompany a False verdict, so the two dicts are read
+        # together; in-memory only, for the same reason (the locked paths may
+        # not re-probe, and the display must not outlive the condition).
+        self._foreign_owners: dict[
+            tuple[str, str, str, str, str, str], str
+        ] = {}
+
+        # Owner slots whose backup THIS collect pass healed from a foreign
+        # live credential. Reset at the start of every pass and read at its
+        # end: the dead-token scan runs before the active slot's fetch, so a
+        # slot healed by that fetch was already quarantined against its
+        # pre-heal backup and has to be re-decided before the pass returns.
+        self._healed_owner_slots: set[str] = set()
 
         # Definitive ownership verdicts for credential lineages, keyed by
         # _lineage_key (slot, caller email, stored email, org, uuid,
@@ -4279,21 +4327,25 @@ class ClaudeAccountSwitcher:
                         self._resync_rotated_backup(
                             account_num, email, org_uuid, creds
                         )
-                    if self._probe_verdicts and self._probe_verdicts.get(
-                        self._lineage_key(
-                            account_num, email,
-                            oauth.credential_fingerprint(creds) or "",
-                        )
-                    ) is False:
+                    served_key = self._lineage_key(
+                        account_num, email,
+                        oauth.credential_fingerprint(creds) or "",
+                    )
+                    if (
+                        self._probe_verdicts
+                        and self._probe_verdicts.get(served_key) is False
+                    ):
                         # The probe just proved the served credential is
                         # another account's: its quota is not this slot's,
                         # and recording it would poison history and switch
                         # decisions (#117's mis-keying shape). The sentinel
                         # reads as unknown headroom to autoswitch, whose
                         # failover switch stashes the foreign credential
-                        # and restores the slot's backup — the repair.
+                        # and restores the slot's backup — the repair. The
+                        # owner rides along so the display can name it.
                         return FetchRecord(
-                            sentinel=USAGE_FOREIGN_CREDENTIAL
+                            sentinel=USAGE_FOREIGN_CREDENTIAL,
+                            foreign_owner=self._foreign_owners.get(served_key),
                         )
                 return FetchRecord(
                     usage=outcome.usage,
@@ -4455,12 +4507,11 @@ class ClaudeAccountSwitcher:
                     # is forbidden under these locks); the next collect pass
                     # reads it fresh and the oracle-checked resync heals the
                     # backup one pass late.
-                    live_verdict = self._probe_verdicts.get(
-                        self._lineage_key(
-                            account_num, email,
-                            oauth.credential_fingerprint(live) or "",
-                        )
+                    live_key = self._lineage_key(
+                        account_num, email,
+                        oauth.credential_fingerprint(live) or "",
                     )
+                    live_verdict = self._probe_verdicts.get(live_key)
                     if live_verdict is False:
                         # Known-foreign: don't adopt, don't serve usage
                         # mislabeled as this slot's. The foreign sentinel
@@ -4468,7 +4519,8 @@ class ClaudeAccountSwitcher:
                         # idle-holding — the switch is what repairs the
                         # drift.
                         return FetchRecord(
-                            sentinel=USAGE_FOREIGN_CREDENTIAL
+                            sentinel=USAGE_FOREIGN_CREDENTIAL,
+                            foreign_owner=self._foreign_owners.get(live_key),
                         )
                     working = live
                     if live_verdict or (
@@ -4749,6 +4801,177 @@ class ClaudeAccountSwitcher:
             retry_after_s=outcome.retry_after_s,
         )
 
+    def _adopt_into_owner_slot(
+        self, account_num: str, slot: str, creds: str
+    ) -> bool:
+        """Write a proven-foreign live credential into the slot that owns it.
+
+        Returns whether the bytes reached that slot's backup.
+
+        This is the switch path's adoption (``_adopt_foreign_credential``,
+        reached from ``_classify_outgoing_credential``'s ``"foreign"``)
+        brought to the COLLECT path, and it exists because waiting for a
+        switch is not free. Measured field shape: a switch to slot B leaves B
+        live, then something rewrites ``~/.claude.json`` back to slot A's
+        identity (a Claude Code session that outlived the switch saving its
+        in-memory config). Now A is "active" by config while B's credential
+        is live, and Claude Code rotates it — so B's own backup becomes the
+        consumed predecessor. From that moment:
+
+        - A can never be measured (its live credential is foreign — the
+          ``USAGE_FOREIGN_CREDENTIAL`` sentinel), and
+        - B is polled from its spent backup, whose first POST returns
+          ``invalid_grant``. At ``AUTH_DEAD_STRIKES = 1`` that single answer
+          quarantines B as "re-login needed — refresh token dead" while the
+          live successor of that very account sits in the live store.
+
+        Nothing clears that until a switch runs the adoption. Doing it here
+        keeps the false quarantine from forming at all: the strike binds to a
+        fingerprint, so writing the successor into B's backup both heals an
+        existing strike and stops the next pass from earning one.
+
+        The same guarantees as the switch path, and no new ones:
+
+        - **Attribution** is the caller's (``_managed_slot_for_resolved``,
+          uuid-positive only) and rests on the profile oracle answering for a
+          credential the usage endpoint JUST accepted — live bytes, not a
+          guess.
+        - **Generation**: ``_adopt_foreign_credential`` refuses anything not
+          provably AHEAD of what the owning slot already holds (same lineage,
+          partial token pair, refresh token past its own expiry, an older
+          ``expiresAt``, an unreadable backup). Identity says whose the bytes
+          are; it never says they are newer.
+        - **Locks and re-checks**: the account FileLock then Claude Code's
+          credential lock, in the switch path's order. Under them the owning
+          slot must still carry the identity it had when it was attributed
+          (a remove/re-add landing in the gap must not inherit the verdict),
+          and the live store must still hold the probed lineage. The written
+          bytes are the freshly re-read live ones, not the collector's copy:
+          the fingerprint covers the refresh token, so a live access token
+          that moved since the probe belongs to the same attributed lineage.
+
+        Best-effort and silent on failure, like its caller: a lock we cannot
+        take or bytes that moved mid-flight just leave the backup where it
+        was, and the next pass tries again. Never raises.
+        """
+        try:
+            data = self._get_sequence_data() or {}
+            owner = data.get("accounts", {}).get(slot)
+            if owner is None:
+                return False
+            owner_email = owner.get("email", "")
+            if not owner_email:
+                return False
+            # The identity the attribution was made against, captured before
+            # the lock and required to still hold under it.
+            owner_ident = (
+                owner_email,
+                owner.get("organizationUuid", "") or "",
+                (owner.get("uuid") or "").strip(),
+            )
+            fp = oauth.credential_fingerprint(creds)
+            with (
+                FileLock(self.lock_file),
+                claude_credentials_lock(),
+            ):
+                locked = (
+                    (self._get_sequence_data() or {})
+                    .get("accounts", {})
+                    .get(slot)
+                )
+                if locked is None or (
+                    locked.get("email", ""),
+                    locked.get("organizationUuid", "") or "",
+                    (locked.get("uuid") or "").strip(),
+                ) != owner_ident:
+                    return False  # slot re-created for another account
+                live = self._read_credentials()
+                if not live or oauth.credential_fingerprint(live) != fp:
+                    # A read error, a cleared store, or a switch/login in the
+                    # gap — the bytes the oracle attributed are no longer the
+                    # live ones, and only those may be adopted.
+                    return False
+                adopted = self._adopt_foreign_credential(
+                    slot, owner_email, live
+                )
+                if adopted:
+                    self._healed_owner_slots.add(slot)
+                return adopted
+        except Exception as e:  # never break a collect pass over this
+            self._logger.debug(
+                "Routing account %s's foreign live credential into "
+                "Account-%s's backup failed (%s); the next pass retries.",
+                account_num, slot, e,
+            )
+            return False
+
+    def _report_foreign_live_credential(
+        self,
+        account_num: str,
+        email: str,
+        fingerprint: str,
+        creds: str,
+        resolved: dict,
+    ) -> None:
+        """Record, heal and (once) report a foreign live credential.
+
+        Called with a DEFINITIVE foreign verdict in hand. Three things follow
+        from it, in this order:
+
+        1. the owning slot is attributed uuid-positively and memoized beside
+           the verdict, so every surface can name the account instead of
+           saying "another account" (``UsageEntry.foreign_owner``);
+        2. the bytes are routed into that slot's backup — see
+           :meth:`_adopt_into_owner_slot` for why waiting for a switch costs
+           the owner a false "re-login needed";
+        3. the drift is logged ONCE per state. A drifted config persists for
+           as long as the user leaves it, and every collect pass would
+           otherwise repeat the line; keying the record on the resolved owner
+           (rather than on a bare "warned" flag) still re-reports a drift
+           that changes shape.
+        """
+        data = self._get_sequence_data() or {}
+        owner = self._managed_slot_for_resolved(resolved, data)
+        if owner == account_num:
+            # The attribution contradicts the verdict that got us here; trust
+            # neither enough to write. (Not reachable through
+            # _resolved_matches_slot_identity's uuid arm — kept because the
+            # two answer through different identity paths.)
+            owner = None
+        key = self._lineage_key(account_num, email, fingerprint)
+        adopted = False
+        if owner is None:
+            self._foreign_owners.pop(key, None)
+        else:
+            self._foreign_owners[key] = owner
+            adopted = self._adopt_into_owner_slot(account_num, owner, creds)
+        state = owner or ""
+        if self._drift_warned.get((account_num, email)) == state:
+            return
+        self._drift_warned[(account_num, email)] = state
+        if owner is None:
+            self._logger.warning(
+                "Live credential resolves to a different account than "
+                "Account-%s's identity; backup left untouched (foreign "
+                "credential under a stale config).",
+                account_num,
+            )
+            return
+        owner_email = data.get("accounts", {}).get(owner, {}).get("email", "")
+        self._logger.warning(
+            "Config/credential drift: the live login belongs to Account-%s "
+            "(%s) while ~/.claude.json names Account-%s (%s) — usually a "
+            "Claude Code session that outlived a switch rewriting the "
+            "config. %s Switch to realign the config.",
+            owner, owner_email, account_num, email,
+            (
+                f"Account-{owner}'s backup was resynced from the live store "
+                "(it stays pollable)."
+                if adopted
+                else f"Account-{owner}'s backup was left as it is."
+            ),
+        )
+
     def _resync_rotated_backup(
         self, account_num: str, email: str, org_uuid: str, creds: str
     ) -> None:
@@ -4798,7 +5021,16 @@ class ClaudeAccountSwitcher:
                 self._lineage_key(account_num, email, fp)
             )
             if verdict is False:
-                return  # known-foreign lineage; already warned
+                # Known-foreign lineage: already probed, already warned. The
+                # routing is retried anyway — the attempt that minted the
+                # verdict may have lost a lock race, and repeating it is a
+                # no-op once the owning slot's backup holds these bytes.
+                owner = self._foreign_owners.get(
+                    self._lineage_key(account_num, email, fp)
+                )
+                if owner is not None:
+                    self._adopt_into_owner_slot(account_num, owner, creds)
+                return
             if verdict is not True:
                 resolved = oauth.fetch_oauth_profile(
                     oauth.extract_access_token(creds) or ""
@@ -4828,18 +5060,11 @@ class ClaudeAccountSwitcher:
                     self._lineage_key(account_num, email, fp)
                 ] = match
                 if not match:
-                    key = (account_num, email, "resync")
-                    if key not in self._provenance_warned:
-                        self._provenance_warned.add(key)
-                        self._logger.warning(
-                            "Live credential resolves to a different "
-                            "account than Account-%s's identity; backup "
-                            "left untouched (foreign credential under a "
-                            "stale config).",
-                            account_num,
-                        )
+                    self._report_foreign_live_credential(
+                        account_num, email, fp, creds, resolved
+                    )
                     return
-                self._provenance_warned.discard((account_num, email, "resync"))
+                self._drift_warned.pop((account_num, email), None)
             with (
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
@@ -5091,6 +5316,7 @@ class ClaudeAccountSwitcher:
         (stale-on-error).
         """
         store = self._usage_store
+        self._healed_owner_slots.clear()
         identities = {
             str(num): (email, org_uuid or "")
             for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
@@ -5100,6 +5326,9 @@ class ClaudeAccountSwitcher:
         # (e.g. Fable) resets, matching the poll planner's window view.
         _threshold, models = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
+        # Companion to ``sentinels``: the managed slot a foreign live
+        # credential was proven to belong to, for the surfaces that name it.
+        owners: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
             if static is not None:
@@ -5180,6 +5409,13 @@ class ClaudeAccountSwitcher:
             for num, record in accepted_records.items():
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
+                    # Rides on the sentinel and only on it: a later pass that
+                    # sentinels this slot for a different reason must not
+                    # inherit an owner attribution made for the foreign one.
+                    if record.foreign_owner is not None:
+                        owners[num] = record.foreign_owner
+                    else:
+                        owners.pop(num, None)
             entries = store.entries(identities, models)
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
@@ -5192,8 +5428,29 @@ class ClaudeAccountSwitcher:
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
+        # A slot whose backup the active fetch just healed (its successor was
+        # stranded in the live store under a drifted config) was quarantined
+        # by the dead-token scan ABOVE — which ran before the fetch, against
+        # the spent backup. Leaving that standing would print "re-login
+        # needed" over an account that is fine for the whole pass, and THIS
+        # pass is the one the user is looking at. Re-decide it against the
+        # credential the slot now holds, and clear the strike row so the next
+        # pass polls it instead of skipping it as quarantined.
+        for num in self._healed_owner_slots & set(info_by_num):
+            if sentinels.get(num) != USAGE_RELOGIN_REQUIRED:
+                continue
+            _i = info_by_num[num]
+            healed = self._read_account_credentials(num, _i[1])
+            if self._entry_token_dead(entries[num], num, _i[1], healed, _i[4]):
+                continue
+            del sentinels[num]
+            self._usage_store.clear_dead_token([num], {num: identities[num]})
+            entries = store.entries(identities, models)
+
         return {
-            num: with_sentinel(entries[num], sentinels.get(num))
+            num: with_sentinel(
+                entries[num], sentinels.get(num), owners.get(num)
+            )
             for num in info_by_num
         }
 
@@ -5581,6 +5838,63 @@ class ClaudeAccountSwitcher:
                 seen[key] = snum
         return out
 
+    def _credential_drift_warnings(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        entries: dict[str, UsageEntry],
+    ) -> list[str]:
+        """The active row and the live login naming different accounts.
+
+        The per-row note already says a slot's live credential is another
+        account's, but a note under the row cannot say the thing that
+        actually confuses people here: the ``(active)`` marker is on the
+        wrong account. ``(active)`` is read from ``~/.claude.json`` alone
+        (see :meth:`current_account_number`, which must not guess), so when
+        the config drifts away from the credential store — a Claude Code
+        session that outlived a switch saving its in-memory identity — the
+        listing marks slot A active while Claude Code is in fact running as
+        slot B, one row below, looking perfectly ordinary.
+
+        So it is said once, after the list, next to the other cross-account
+        warnings, with the command that realigns it. Only for an attributed
+        owner: an unmanaged foreign login has no slot to name and no switch
+        to offer, and the row's own note already covers it.
+
+        The collect pass keeps the owning slot's backup in sync on its own
+        (see :meth:`_adopt_into_owner_slot`), so this is about the config
+        alone — nothing here is load-bearing for that account's health.
+        """
+        handles = {
+            str(num): (alias or str(num), email)
+            for num, email, _org_name, _org_uuid, _active, _creds, alias
+            in accounts_info
+        }
+        out: list[str] = []
+        for num, _email, _org_name, _org_uuid, is_active, _creds, _alias in (
+            accounts_info
+        ):
+            snum = str(num)
+            entry = entries.get(snum)
+            if not is_active or entry is None:
+                continue
+            if (
+                entry.sentinel != USAGE_FOREIGN_CREDENTIAL
+                or not entry.foreign_owner
+            ):
+                continue
+            owner = handles.get(entry.foreign_owner)
+            if owner is None:
+                continue  # owner slot is not in this listing
+            handle, owner_email = owner
+            out.append(
+                f"Account-{snum} is marked active, but the live login "
+                f"belongs to Account-{entry.foreign_owner} ({owner_email}) "
+                "— the config drifted away from the credential store, "
+                "usually a Claude Code session that outlived a switch. "
+                f"Realign them with: cswap switch {handle}"
+            )
+        return out
+
     def _build_list_payload(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -5613,6 +5927,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    live_credential_owner=entry.foreign_owner,
                 )
             )
         payload = {
@@ -5628,6 +5943,9 @@ class ClaudeAccountSwitcher:
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
         if lockstep_warnings:
             payload["lockstepUsageWarnings"] = lockstep_warnings
+        drift_warnings = self._credential_drift_warnings(accounts_info, entries)
+        if drift_warnings:
+            payload["credentialDriftWarnings"] = drift_warnings
         unclaimed = self._store._list_unclaimed_credentials()
         if unclaimed:
             payload["unclaimedCredentials"] = sorted(unclaimed)
@@ -5693,11 +6011,14 @@ class ClaudeAccountSwitcher:
         # in the JSON payload and logs for diagnostics.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
-        if dup_warnings or lockstep_warnings:
+        drift_warnings = self._credential_drift_warnings(accounts_info, entries)
+        if dup_warnings or lockstep_warnings or drift_warnings:
             print()
             for msg in dup_warnings:
                 warning(msg)
             for msg in lockstep_warnings:
+                warning(msg)
+            for msg in drift_warnings:
                 warning(msg)
 
         # Running instances
@@ -6542,6 +6863,79 @@ class ClaudeAccountSwitcher:
             self._logger.debug(f"Profile resolution raised: {e!r}")
         return result
 
+    def _resolved_slot_candidate(
+        self, resolved: dict, data: dict
+    ) -> str | None:
+        """The managed slot an oracle-resolved identity points at, or None.
+
+        Candidate only — it answers "which slot does this identity look
+        like", not "is that attribution strong enough to act on"; the
+        uuid-positive gate is :meth:`_slot_attribution_is_uuid_positive`, and
+        callers that will name the slot in user output or write into its
+        backup must pass it too.
+
+        Two lookups, in the codebase's usual order. The (email, org)
+        composite first, since that IS identity for slots throughout this
+        class; then the account uuid (org-scoped) as a fallback for a slot
+        whose stored email is stale or synthesized (add-token placeholder).
+        A composite hit whose uuid CONFLICTS is dropped rather than returned:
+        the same email can be recycled by a deleted-and-recreated account,
+        and treating it as the slot would poison that slot's backup.
+        """
+        r_email = resolved.get("email") or ""
+        r_org = resolved.get("organizationUuid") or ""
+        r_uuid = (resolved.get("uuid") or "").strip()
+        slot = self._find_account_slot(data, r_email, r_org) if r_email else None
+        if slot is not None and r_uuid:
+            stored_uuid = (
+                data.get("accounts", {}).get(slot, {}).get("uuid") or ""
+            ).strip()
+            if stored_uuid and stored_uuid != r_uuid:
+                slot = None
+        if slot is None and r_uuid:
+            for num, acct in data.get("accounts", {}).items():
+                if (
+                    acct.get("uuid")
+                    and acct.get("uuid") == r_uuid
+                    and (acct.get("organizationUuid", "") or "") == r_org
+                ):
+                    slot = num
+                    break
+        return slot
+
+    @staticmethod
+    def _slot_attribution_is_uuid_positive(
+        slot: str, resolved: dict, data: dict
+    ) -> bool:
+        """Whether attributing ``resolved`` to ``slot`` rests on matching uuids.
+
+        An (email, org) match against a slot carrying no recorded uuid is not
+        evidence enough to name that slot to the user or to write into its
+        backup — uuids are stable where an email can be recycled.
+        """
+        r_uuid = (resolved.get("uuid") or "").strip()
+        stored_uuid = (
+            data.get("accounts", {}).get(slot, {}).get("uuid") or ""
+        ).strip()
+        return bool(r_uuid) and stored_uuid == r_uuid
+
+    def _managed_slot_for_resolved(
+        self, resolved: dict, data: dict
+    ) -> str | None:
+        """Uuid-positive attribution of a resolved identity to a managed slot.
+
+        The two steps above in the one combination every caller outside
+        :meth:`_classify_outgoing_credential` wants: a slot number it may act
+        on, or None. (The classifier keeps them apart because it must tell a
+        weak attribution — ``"alien"`` — from no attribution at all.)
+        """
+        slot = self._resolved_slot_candidate(resolved, data)
+        if slot is None or not self._slot_attribution_is_uuid_positive(
+            slot, resolved, data
+        ):
+            return None
+        return slot
+
     def _classify_outgoing_credential(
         self,
         current_account: str,
@@ -6638,28 +7032,7 @@ class ClaudeAccountSwitcher:
             not r_org or not own_org or r_org == own_org
         ):
             return ("own-rotated", None)
-        slot = self._find_account_slot(data, r_email, r_org) if r_email else None
-        if slot is not None and r_uuid:
-            # When both sides carry a uuid it must agree: an email+org match
-            # with a conflicting uuid is a *different* account wearing a
-            # recycled email (e.g. deleted/recreated claude.ai account), and
-            # treating it as the slot would poison the slot's backup.
-            stored_uuid = (
-                data.get("accounts", {}).get(slot, {}).get("uuid") or ""
-            ).strip()
-            if stored_uuid and stored_uuid != r_uuid:
-                slot = None
-        if slot is None and r_uuid:
-            # Fall back to the account uuid (org-scoped) in case the slot's
-            # stored email is stale or synthesized (add-token placeholder).
-            for num, acct in data.get("accounts", {}).items():
-                if (
-                    acct.get("uuid")
-                    and acct.get("uuid") == r_uuid
-                    and (acct.get("organizationUuid", "") or "") == r_org
-                ):
-                    slot = num
-                    break
+        slot = self._resolved_slot_candidate(resolved, data)
         if slot == current_account:
             return ("own-rotated", None)
         if slot is None:
@@ -6673,10 +7046,7 @@ class ClaudeAccountSwitcher:
         # A cross-slot attribution must be uuid-positive: an email+org match
         # against a slot with no recorded uuid (add-token placeholder) is not
         # evidence enough to name that slot in user output — treat as alien.
-        stored_uuid = (
-            data.get("accounts", {}).get(slot, {}).get("uuid") or ""
-        ).strip()
-        if not r_uuid or stored_uuid != r_uuid:
+        if not self._slot_attribution_is_uuid_positive(slot, resolved, data):
             return ("alien", None)
         foreign_email = data.get("accounts", {}).get(slot, {}).get("email", "")
         foreign_backup = self._read_account_credentials(slot, foreign_email)

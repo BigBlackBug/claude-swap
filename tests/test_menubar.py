@@ -442,10 +442,13 @@ def test_parse_switch_history_empty_or_no_matches():
 # --- snapshot adapter (fakes for AccountsSnapshot / UsageEntry) -----------------
 
 class _FakeEntry:
-    def __init__(self, sentinel=None, last_good=None, fetched_at=None):
+    def __init__(
+        self, sentinel=None, last_good=None, fetched_at=None, foreign_owner=None
+    ):
         self.sentinel = sentinel
         self.last_good = last_good
         self.fetched_at = fetched_at
+        self.foreign_owner = foreign_owner
 
 
 class _FakeAcct:
@@ -466,10 +469,20 @@ class _FakeSnap:
 def test_account_display_usage_sentinel_note_last_good_or_none():
     assert menubar._account_display_usage(
         _FakeEntry(sentinel=USAGE_API_KEY)
-    ) == menubar.SENTINEL_NOTES[USAGE_API_KEY]
+    ) == menubar.sentinel_note(USAGE_API_KEY)
     lg = {"five_hour": {"pct": 5.0}}
     assert menubar._account_display_usage(_FakeEntry(last_good=lg)) == lg
     assert menubar._account_display_usage(_FakeEntry()) is None
+
+
+def test_account_display_usage_names_the_foreign_owner():
+    """The menubar describes a sentinel state in the same words `cswap list`
+    does — including the owning slot when the collector attributed one."""
+    from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+
+    assert menubar._account_display_usage(
+        _FakeEntry(sentinel=USAGE_FOREIGN_CREDENTIAL, foreign_owner="2")
+    ) == "live credential belongs to Account-2 — a switch repairs it"
 
 
 def test_adapt_snapshot_shape_and_active_selection():
@@ -488,7 +501,7 @@ def test_adapt_snapshot_shape_and_active_selection():
     assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
     # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
+        "2", "b@x.com", False, menubar.sentinel_note(USAGE_API_KEY), None, "", True, None,
     )
 
 

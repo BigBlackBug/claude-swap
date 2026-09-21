@@ -188,6 +188,26 @@ class TestJsonHelpers:
 
         assert "loginExpiresAt" not in account_row(1, "a@x.com", "", "", True, None)
 
+    def test_account_row_names_the_live_credential_owner(self):
+        """Under the foreign sentinel, a script gets the same answer the human
+        note gives: WHICH managed slot the live credential belongs to."""
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, account_row
+
+        row = account_row(
+            1, "a@x.com", "", "", True, USAGE_FOREIGN_CREDENTIAL,
+            live_credential_owner="2",
+        )
+        assert row["usageStatus"] == "foreign_credential"
+        assert row["liveCredentialOwner"] == "2"
+
+    def test_account_row_omits_owner_when_unattributable(self):
+        """An unmanaged or uuid-less foreign login names no slot, and the
+        field is absent rather than empty — consumers key on presence."""
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, account_row
+
+        row = account_row(1, "a@x.com", "", "", True, USAGE_FOREIGN_CREDENTIAL)
+        assert "liveCredentialOwner" not in row
+
 
 # --------------------------------------------------------------------------- #
 # --list --json

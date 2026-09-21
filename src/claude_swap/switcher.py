@@ -5731,7 +5731,9 @@ class ClaudeAccountSwitcher:
         return None, "stay"
 
     def _duplicate_account_warnings(
-        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        entries: dict[str, UsageEntry],
     ) -> list[str]:
         """Slots that provably authenticate as the same account.
 
@@ -5750,13 +5752,34 @@ class ClaudeAccountSwitcher:
         offline-detectable here — ``_lockstep_usage_warnings`` covers that
         case heuristically. The switch-time guard prevents new occurrences
         whenever the identity oracle answers.
+
+        ``entries`` is read for one exception. The active row's credential is
+        the LIVE one (``_build_accounts_info``), and under config drift the
+        live credential is provably another slot's — so its fingerprint
+        matches that slot's backup and this check fired "one slot's backup
+        was overwritten. Log in with the missing account and re-add it",
+        sending the user to burn a healthy stored grant when both backups
+        were intact and a switch was the whole fix (measured: the drift note
+        printed the correct remedy two lines below the wrong one). The live
+        bytes say nothing about what this slot stores, so ask its backup
+        instead — that IS the question this warning asks.
         """
         data = self._get_sequence_data() or {}
         by_fp: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
         out: list[str] = []
-        for num, email, _org_name, org_uuid, _is_active, creds, _alias in accounts_info:
+        for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
             snum = str(num)
+            entry = entries.get(snum)
+            if (
+                is_active
+                and entry is not None
+                and entry.sentinel == USAGE_FOREIGN_CREDENTIAL
+            ):
+                # Drift, not a collision: compare what this slot stores. An
+                # unreadable or absent backup yields "" → no fingerprint, and
+                # the row simply carries no evidence either way.
+                creds = self._read_account_credentials(snum, email)
             fp = oauth.credential_fingerprint(creds) if creds else None
             if fp:
                 other = by_fp.get(fp)
@@ -5937,7 +5960,7 @@ class ClaudeAccountSwitcher:
         }
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
-        dup_warnings = self._duplicate_account_warnings(accounts_info)
+        dup_warnings = self._duplicate_account_warnings(accounts_info, entries)
         if dup_warnings:
             payload["duplicateAccountWarnings"] = dup_warnings
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
@@ -6009,7 +6032,7 @@ class ClaudeAccountSwitcher:
         # here: users can't act on them (recovery is always /login + cswap
         # add), and with no GC a one-time event would nag forever. They stay
         # in the JSON payload and logs for diagnostics.
-        dup_warnings = self._duplicate_account_warnings(accounts_info)
+        dup_warnings = self._duplicate_account_warnings(accounts_info, entries)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
         drift_warnings = self._credential_drift_warnings(accounts_info, entries)
         if dup_warnings or lockstep_warnings or drift_warnings:

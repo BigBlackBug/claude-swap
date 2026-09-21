@@ -8046,7 +8046,7 @@ class TestDuplicateAccountDetection:
             (1, "account1@example.com", "", "", True, same, ""),
             (2, "account2@example.com", "", "", False, same, ""),
         ]
-        warnings = switcher._duplicate_account_warnings(info)
+        warnings = switcher._duplicate_account_warnings(info, {})
         assert len(warnings) == 1
         assert "Account-1 and Account-2" in warnings[0]
 
@@ -8059,7 +8059,7 @@ class TestDuplicateAccountDetection:
             (1, "account1@example.com", "", "", True, "creds-a", ""),
             (2, "account2@example.com", "", "", False, "creds-b", ""),
         ]
-        warnings = switcher._duplicate_account_warnings(info)
+        warnings = switcher._duplicate_account_warnings(info, {})
         assert len(warnings) == 1
         assert "both authenticate" in warnings[0]
 
@@ -8074,7 +8074,7 @@ class TestDuplicateAccountDetection:
             (1, "setup-token-1@token.local", "", "", True, "creds-a", ""),
             (2, "setup-token-2@token.local", "", "", False, "creds-b", ""),
         ]
-        assert switcher._duplicate_account_warnings(info) == []
+        assert switcher._duplicate_account_warnings(info, {}) == []
 
     def test_clean_accounts_produce_no_warnings(
         self, temp_home, sample_sequence_data,
@@ -8086,7 +8086,90 @@ class TestDuplicateAccountDetection:
             (2, "account2@example.com", "", "", False,
              json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}}), ""),
         ]
-        assert switcher._duplicate_account_warnings(info) == []
+        assert switcher._duplicate_account_warnings(info, {}) == []
+
+    # -- config drift is not a collision ---------------------------------
+    #
+    # The active row carries the LIVE credential, so while ~/.claude.json
+    # names slot A and the live login is slot B's, A's row holds B's bytes.
+    # Comparing those reported "one slot's backup was overwritten" with a
+    # remedy that burns a healthy grant, while both backups were intact.
+
+    def _foreign_entries(self, owner="2"):
+        from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL
+        from claude_swap.usage_store import UsageEntry, with_sentinel
+
+        return {
+            "1": with_sentinel(UsageEntry(), USAGE_FOREIGN_CREDENTIAL, owner),
+            "2": UsageEntry(),
+        }
+
+    def test_drift_is_not_reported_as_an_overwritten_backup(
+        self, temp_home, sample_sequence_data,
+    ):
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        theirs = json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}})
+        switcher._write_account_credentials(
+            "1", "account1@example.com",
+            json.dumps({"claudeAiOauth": {"refreshToken": "rt-1"}}),
+        )
+        # Slot 1 is active and holds slot 2's live bytes; its own backup is fine.
+        info = [
+            (1, "account1@example.com", "", "", True, theirs, ""),
+            (2, "account2@example.com", "", "", False, theirs, ""),
+        ]
+        assert switcher._duplicate_account_warnings(
+            info, self._foreign_entries()
+        ) == []
+
+    def test_drift_still_flags_a_genuinely_overwritten_backup(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The check is not silenced, only re-aimed: if the active slot's own
+        backup really does hold another slot's credential, say so."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        theirs = json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}})
+        switcher._write_account_credentials("1", "account1@example.com", theirs)
+        info = [
+            (1, "account1@example.com", "", "", True, theirs, ""),
+            (2, "account2@example.com", "", "", False, theirs, ""),
+        ]
+        warnings = switcher._duplicate_account_warnings(
+            info, self._foreign_entries()
+        )
+        assert len(warnings) == 1
+        assert "Account-1 and Account-2" in warnings[0]
+
+    def test_drift_with_no_readable_backup_claims_nothing(
+        self, temp_home, sample_sequence_data,
+    ):
+        """No stored bytes to compare is no evidence, not a collision."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        theirs = json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}})
+        info = [
+            (1, "account1@example.com", "", "", True, theirs, ""),
+            (2, "account2@example.com", "", "", False, theirs, ""),
+        ]
+        assert switcher._duplicate_account_warnings(
+            info, self._foreign_entries()
+        ) == []
+
+    def test_inactive_row_keeps_comparing_its_own_backup(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The exception is the active row's alone — an inactive row's creds
+        already ARE its backup, and a foreign sentinel there (a stale
+        attribution) must not send the check reading it twice."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        same = json.dumps({"claudeAiOauth": {"refreshToken": "rt-shared"}})
+        info = [
+            (1, "account1@example.com", "", "", False, same, ""),
+            (2, "account2@example.com", "", "", False, same, ""),
+        ]
+        warnings = switcher._duplicate_account_warnings(
+            info, self._foreign_entries("2")
+        )
+        assert len(warnings) == 1
 
 
 class TestLockstepUsageDetection:

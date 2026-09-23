@@ -1957,6 +1957,22 @@ class AutoSwitchEngine:
         one spent account. Several are returned at once, in chain order, so
         an element whose token turns out to be dead falls through to the next
         one on the existing activation loop rather than parking the wave.
+
+        Once anchored, "should we move?" is asked about the element the wave
+        stands on, not about whatever ``~/.claude.json`` names. The two part
+        ways when something outside the wave moves the login -- a Claude Code
+        session that outlived a switch rewriting the config, a manual
+        ``/login`` or ``cswap switch``. Measured: a wave on step 1/2 (Account-2,
+        81%) saw the config drift onto Account-1, read Account-1's 96% as its
+        own element being spent, and burned step 2 while step 1 still had
+        room. So:
+
+        - moved onto a LATER element: the move is taken as the wave's -- adopt
+          that position (the earliest one past ours, for a repeated element);
+        - anywhere else (off the chain, or an element already walked): go back
+          to our element, as the initial anchoring does and for the same
+          reason -- the chain says where the wave is. Only when that element
+          has itself gone over its bar does the wave move on from it.
         """
         assert self._sequence is not None
         chain = self._sequence
@@ -1967,6 +1983,25 @@ class AutoSwitchEngine:
                 self._seq_pos = 0
             else:
                 return [chain[0]], ""
+        elif current != chain[self._seq_pos]:
+            later = next(
+                (
+                    pos
+                    for pos in range(self._seq_pos + 1, len(chain))
+                    if chain[pos] == current
+                ),
+                None,
+            )
+            if later is not None:
+                self._seq_pos = later
+            else:
+                # `over_bar` describes an account that is not ours: ask our
+                # element instead. Room left → go back to it; spent → it is
+                # our element that is over the bar, so move on from it.
+                home = chain[self._seq_pos]
+                over_bar = self._over_bar(home, usage.get(home))
+                if not over_bar:
+                    return [home], ""
         if not over_bar:
             return [], "holding"
         ahead = [
@@ -2004,6 +2039,11 @@ class AutoSwitchEngine:
             return outcome
         if self._seq_finishing:
             self._seq_done = True
+            return outcome
+        if self._seq_pos >= 0 and self._sequence[self._seq_pos] == num:
+            # Back onto our own element after an outside move: the position
+            # stands. Without this, a chain repeating the element (2 3 2)
+            # would read the return as reaching its later copy and skip 3.
             return outcome
         for pos in range(self._seq_pos + 1, len(self._sequence)):
             if self._sequence[pos] == num:

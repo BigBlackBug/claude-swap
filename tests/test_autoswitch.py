@@ -2887,6 +2887,94 @@ class TestSequenceWave:
         assert h.active_number() == 2
         assert h.engine._seq_done is False  # the third element, not the finish
 
+    # -- the login moved under the wave -----------------------------------
+    #
+    # `(active)` is read from ~/.claude.json alone, and a Claude Code
+    # session that outlived a switch rewrites it. Measured: a wave on step
+    # 1/2 (Account-2, 81%) saw the config drift onto Account-1, read its 96%
+    # as step 1 being spent, and burned step 2.
+
+    def test_an_outside_move_off_the_chain_goes_back_to_our_element(
+        self, temp_home,
+    ):
+        h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        assert h.active_number() == 2
+        h.make_live("a@example.com", 1)          # the drift
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 96), "2": _usage7(81, 16), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2            # back, not on to 3
+        assert h.engine.sequence_position == 0   # step 1 is still ours
+
+    def test_an_outside_move_goes_back_even_from_an_account_with_room(
+        self, temp_home,
+    ):
+        """The foreign account's usage is not the wave's business either
+        way — the initial anchoring leaves a roomy account for the same
+        reason."""
+        h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(50, 50), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_outside_move_moves_on_when_our_element_is_spent(
+        self, temp_home,
+    ):
+        """Going back onto a spent element would hand over a dead session:
+        it is then OUR element that is over its bar, and the wave advances
+        from it exactly as it would have without the drift."""
+        h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine.sequence_position == 1
+
+    def test_an_outside_move_onto_a_later_element_is_adopted(self, temp_home):
+        """Moved forward along the chain by hand: that IS the wave's next
+        step, so take the position rather than dragging the login back."""
+        h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.make_live("c@example.com", 3)
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(50, 50),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # holding on 3, not back to 2
+        assert h.engine.sequence_position == 1
+        # ...and 3 is the last step: spent, the wave parks on the head.
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(95, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine._seq_done is True
+
+    def test_going_back_to_a_repeated_element_keeps_the_position(
+        self, temp_home,
+    ):
+        """In `2 3 2` the return to 2 is step 1 resumed, not step 3 reached —
+        reading it as the later copy would silently skip 3."""
+        h = self._harness(temp_home, chain=("2", "3", "2"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(50, 50), "3": _usage7(5, 5)})
+        assert h.active_number() == 2
+        assert h.engine.sequence_position == 0
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
 
 class TestPerWindowThresholds:
     """One bar per window instead of one bar over the binding window.

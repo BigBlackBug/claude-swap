@@ -2787,7 +2787,8 @@ class TestSequenceWave:
     """`cswap auto --seq 2 3 1` — a scripted wave.
 
     Thresholds still decide WHEN to leave; the chain decides WHERE to go, and
-    the run has a finite job: walk the chain once, park, exit. Everything the
+    the run has a finite job: walk the chain once and exit on its last
+    element. Everything the
     usage-aware strategies do to pick a target — headroom ranking, the
     hysteresis margin, the no-return bar — is deliberately absent, because the
     order was declared by hand.
@@ -2804,8 +2805,7 @@ class TestSequenceWave:
 
     def test_the_chain_declares_where_the_wave_starts(self, temp_home):
         """Account 1 has plenty of room, but the chain starts at 2 — so the
-        wave's first act is to go there. Otherwise "park on the head at the
-        end" would have no anchor to be an end of."""
+        wave's first act is to go there: the chain is the whole route."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5),
@@ -2846,37 +2846,78 @@ class TestSequenceWave:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 1      # straight back to the account we left
 
-    def test_exhausted_chain_parks_on_the_head_that_recovered(self, temp_home):
+    def test_landing_on_the_last_element_ends_the_wave(self, temp_home):
+        """`--seq 1 2` switched onto 2: that is the end of the route. The run
+        used to stay up watching 2 until it was spent too, then hop back to
+        the head — a job nobody asked for, and a process left hanging."""
         h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        assert h.engine._seq_done is False  # on the head, 3 still to go
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine._seq_done is True
+        finished = [
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "sequence-finished"
+        ]
+        assert len(finished) == 1
+        assert "Account-3" in finished[0].detail
+
+    def test_run_loop_returns_once_the_last_element_is_active(self, temp_home):
+        h = self._harness(temp_home, chain=("2",))
+        usage = {"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)}
+        entries = {num: _entry_for(v, h.clock.now) for num, v in usage.items()}
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            # No stop() anywhere: returning at all is the assertion.
+            assert h.engine.run_loop() == 0
+        assert h.active_number() == 2
+
+    def test_a_one_element_chain_already_active_is_done_at_once(
+        self, temp_home,
+    ):
+        h = self._harness(temp_home, chain=("1",))
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert h.engine._seq_done is True
+
+    def test_a_chain_ending_on_its_head_comes_back_to_it(self, temp_home):
+        """Coming back is spelled out, not implied: `2 3 2`."""
+        h = self._harness(temp_home, chain=("2", "3", "2"))
         h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
         h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5)})
         assert h.active_number() == 3
+        assert h.engine._seq_done is False
         outcome = h.tick_with_usage({
             "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(95, 5),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 2      # back to the head
-        assert h.engine._seq_done is True  # and the run is over
+        assert h.active_number() == 2
+        assert h.engine._seq_done is True
 
-    def test_exhausted_chain_stays_put_when_the_head_is_still_spent(
-        self, temp_home,
-    ):
-        """Hopping onto a spent account to end on a tidy number would hand
-        the user a dead session."""
-        h = self._harness(temp_home, chain=("2", "3"))
+    def test_nothing_ahead_with_room_ends_the_wave_in_place(self, temp_home):
+        """Every element ahead is spent: waiting for one to recover could take
+        a week, and hopping back onto a spent head would hand over a dead
+        session — so the wave ends where it stands."""
+        h = self._harness(temp_home, chain=("2", "3", "1"))
         h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
-        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5)})
         outcome = h.tick_with_usage({
-            "1": _usage7(5, 5), "2": _usage7(99, 99), "3": _usage7(95, 5),
+            "1": _usage7(99, 99), "2": _usage7(95, 5), "3": _usage7(99, 99),
         })
         assert outcome is TickOutcome.NO_ACTION
-        assert h.active_number() == 3
+        assert h.active_number() == 2
         assert h.engine._seq_done is True
 
     def test_a_repeated_element_is_visited_twice(self, temp_home):
-        """The list length is the switch count — repeating an account is how
-        you ask for another pass over it."""
-        h = self._harness(temp_home, chain=("2", "3", "2"))
+        """Repeating an account is how you ask for another pass over it."""
+        h = self._harness(temp_home, chain=("2", "3", "2", "3"))
         h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
         h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(95, 5), "3": _usage7(5, 5)})
         assert h.active_number() == 3
@@ -2885,6 +2926,7 @@ class TestSequenceWave:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+        assert h.engine.sequence_position == 2
         assert h.engine._seq_done is False  # the third element, not the finish
 
     # -- the login moved under the wave -----------------------------------
@@ -2942,7 +2984,7 @@ class TestSequenceWave:
     def test_an_outside_move_onto_a_later_element_is_adopted(self, temp_home):
         """Moved forward along the chain by hand: that IS the wave's next
         step, so take the position rather than dragging the login back."""
-        h = self._harness(temp_home, chain=("2", "3"))
+        h = self._harness(temp_home, chain=("2", "3", "1"))
         h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
         h.make_live("c@example.com", 3)
         outcome = h.tick_with_usage({
@@ -2950,12 +2992,25 @@ class TestSequenceWave:
         })
         assert outcome is TickOutcome.NO_ACTION  # holding on 3, not back to 2
         assert h.engine.sequence_position == 1
-        # ...and 3 is the last step: spent, the wave parks on the head.
+        # ...and when 3 is spent, the wave goes on to its last step.
         outcome = h.tick_with_usage({
             "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(95, 5),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 2
+        assert h.active_number() == 1
+        assert h.engine._seq_done is True
+
+    def test_an_outside_move_onto_the_last_element_ends_the_wave(
+        self, temp_home,
+    ):
+        h = self._harness(temp_home, chain=("2", "3"))
+        h.tick_with_usage({"1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(5, 5)})
+        h.make_live("c@example.com", 3)
+        outcome = h.tick_with_usage({
+            "1": _usage7(5, 5), "2": _usage7(5, 5), "3": _usage7(50, 50),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # no drag back to 2
+        assert h.engine.sequence_position == 1
         assert h.engine._seq_done is True
 
     def test_going_back_to_a_repeated_element_keeps_the_position(

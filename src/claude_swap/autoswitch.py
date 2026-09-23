@@ -749,12 +749,10 @@ class AutoSwitchEngine:
         # Index of the element we are sitting on; -1 = not anchored yet, so
         # the first tick's job is to jump to the head of the chain.
         self._seq_pos = -1
-        # Set once the wave has nothing left to do; `run_loop` reads it and
+        # Set once the wave has nothing left to do -- it landed on the last
+        # element, or nothing ahead of it has room; `run_loop` reads it and
         # returns instead of sleeping until the next interval.
         self._seq_done = False
-        # True while the final hop back to the head is in flight, so the
-        # landing can be recognised as the end rather than as a step.
-        self._seq_finishing = False
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -1097,12 +1095,12 @@ class AutoSwitchEngine:
                 current, usage, self._over_bar(current, usage.get(current))
             )
             if verdict:
-                if verdict == "finished":
+                if verdict in ("finished", "exhausted"):
                     self._seq_done = True
                 self._emit(
                     NoSwitchEvent(
                         reason=(
-                            "sequence-finished" if verdict == "finished"
+                            "sequence-finished" if self._seq_done
                             else "below-threshold"
                         ),
                         detail=self._sequence_detail(verdict, current, settings),
@@ -1942,8 +1940,14 @@ class AutoSwitchEngine:
         """This tick's targets for a scripted wave, as ``(ordered, verdict)``.
 
         ``verdict`` is "" when ``ordered`` is worth acting on, else the reason
-        the wave did nothing: "anchored" (already at the head), "holding" (the
-        active account still has room) or "finished".
+        the wave did nothing: "holding" (the active account still has room),
+        "finished" (standing on the last element) or "exhausted" (the active
+        element is spent and nothing ahead of it has room).
+
+        The last element is where the wave ends: the run exits the moment it
+        lands there, instead of watching that account until it is spent too.
+        A wave that should come back to an account says so by naming it last
+        (``1 2 1``).
 
         The chain is a script, so every selection rule the usage-aware
         strategies apply is deliberately absent: no headroom ranking, no
@@ -1979,10 +1983,11 @@ class AutoSwitchEngine:
         if self._seq_pos < 0:
             # Not anchored: the chain declares where the wave starts, so the
             # head is taken even when the account we are on still has room.
-            if current == chain[0]:
-                self._seq_pos = 0
-            else:
+            if current != chain[0]:
                 return [chain[0]], ""
+            self._seq_pos = 0
+            if len(chain) == 1:
+                return [], "finished"
         elif current != chain[self._seq_pos]:
             later = next(
                 (
@@ -1994,6 +1999,8 @@ class AutoSwitchEngine:
             )
             if later is not None:
                 self._seq_pos = later
+                if later == len(chain) - 1:
+                    return [], "finished"
             else:
                 # `over_bar` describes an account that is not ours: ask our
                 # element instead. Room left → go back to it; spent → it is
@@ -2011,16 +2018,9 @@ class AutoSwitchEngine:
         ]
         if ahead:
             return ahead, ""
-        # Chain exhausted. The head is where the wave parks, but only if it
-        # actually recovered while the wave went round -- hopping onto a
-        # spent account to end on a tidy number would just hand the user a
-        # dead session.
-        if current != chain[0] and not self._over_bar(
-            chain[0], usage.get(chain[0])
-        ):
-            self._seq_finishing = True
-            return [chain[0]], ""
-        return [], "finished"
+        # Every element ahead is already spent. Waiting for one to recover
+        # could take a week; the wave has done what it could, so it ends here.
+        return [], "exhausted"
 
     def _sequence_detail(
         self, verdict: str, current: str, settings: AutoSwitchSettings
@@ -2029,16 +2029,18 @@ class AutoSwitchEngine:
         assert self._sequence is not None
         chain = " → ".join(self._sequence)
         if verdict == "finished":
-            return f"chain {chain} complete; parked on Account-{current}"
+            return f"chain {chain} complete; wave ends on Account-{current}"
+        if verdict == "exhausted":
+            return (
+                f"chain {chain}: nothing ahead has room; "
+                f"wave ends on Account-{current}"
+            )
         step = f"{self._seq_pos + 1}/{len(self._sequence)}"
         return f"chain {chain}, at step {step}; Account-{current} still has room"
 
     def _sequence_note(self, num: str, outcome: TickOutcome) -> TickOutcome:
         """Record where a wave landed. Pass-through outside sequence mode."""
         if self._sequence is None or outcome is not TickOutcome.SWITCHED:
-            return outcome
-        if self._seq_finishing:
-            self._seq_done = True
             return outcome
         if self._seq_pos >= 0 and self._sequence[self._seq_pos] == num:
             # Back onto our own element after an outside move: the position
@@ -2049,6 +2051,18 @@ class AutoSwitchEngine:
             if self._sequence[pos] == num:
                 self._seq_pos = pos
                 break
+        if self._seq_pos == len(self._sequence) - 1:
+            # Landed on the last element: that is the end of the wave, not a
+            # step to watch until it is spent as well.
+            self._seq_done = True
+            self._emit(
+                NoSwitchEvent(
+                    reason="sequence-finished",
+                    detail=self._sequence_detail(
+                        "finished", num, self.settings
+                    ),
+                )
+            )
         return outcome
 
     def _rank_candidates(

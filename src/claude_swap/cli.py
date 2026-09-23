@@ -699,11 +699,11 @@ Defaults live in settings.json in the backup root; flags override them.
         default=None,
         help=(
             "Run one scripted wave: walk these accounts in this order, "
-            "leaving each when it reaches its threshold, then park on the "
-            "first one and exit. Accepts numbers, aliases or emails. Repeat "
-            "an account to visit it twice (the list length is the number of "
-            "switches). Position is held in memory, so it cannot be combined "
-            "with --once"
+            "leaving each when it reaches its threshold, and exit once the "
+            "last one is active. Accepts numbers, aliases or emails. Repeat "
+            "an account to visit it twice (end with the first one, e.g. "
+            "'1 2 1', to come back to it). Position is held in memory, so it "
+            "cannot be combined with --once"
         ),
     )
     parser.add_argument(
